@@ -1,0 +1,12 @@
+# Pip-installable dependencies for the LingBot-VA G1 inference client.
+#
+# Two prerequisites are NOT listed here — install them separately:
+#   * unitree_sdk2py — the Unitree Python SDK. pip install -e . from
+#       https://github.com/unitreerobotics/unitree_sdk2_python
+#       (pulls in cyclonedds==0.10.2).
+#   * teleimager    — the G1 image-server client, from the xr_teleoperate repo.
+
+numpy
+opencv-python
+websockets
+msgpack
