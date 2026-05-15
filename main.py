@@ -35,10 +35,10 @@ import numpy as np
 
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 
-from arm_controller import ArmController, INIT_POSE_READY
-from gripper_controller import GripperController, GRIPPER_MIN, GRIPPER_MAX
-from camera_client import CameraClient
-from policy_client import PolicyClient
+from g1_client.arm_controller import ArmController, INIT_POSE_READY
+from g1_client.gripper_controller import GripperController, GRIPPER_MIN, GRIPPER_MAX
+from g1_client.camera_client import CameraClient
+from g1_client.policy_client import PolicyClient
 
 
 logging.basicConfig(level=logging.INFO,

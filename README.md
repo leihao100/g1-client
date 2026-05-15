@@ -62,15 +62,19 @@ python smoke_test.py --server-host <policy-server-ip> --server-port 29056
 
 ## Repo layout
 
-| File | Role |
-|------|------|
-| `main.py` | Orchestration: setup, init pose, standby, the inference loop, shutdown. |
-| `arm_controller.py` | 14 arm joints on `rt/arm_sdk` @ 50 Hz; body-lock; velocity clamp; kp switching. |
-| `gripper_controller.py` | Dex1 grippers on `rt/dex1/{l,r}/cmd` @ 200 Hz with a per-tick rate cap. |
-| `camera_client.py` | 3-camera capture via `teleimager`, BGR→RGB resize to 256×320. |
-| `policy_client.py` | WebSocket client for the LingBot-VA server (msgpack wire format). |
-| `msgpack_numpy.py` | NumPy support for msgpack — must mirror the server's module. |
-| `smoke_test.py` | Cloud round-trip test, no robot/cameras. |
+```
+main.py                    Entry point — runs the full inference pipeline.
+smoke_test.py              Entry point — cloud round-trip test, no robot/cameras.
+g1_client/                 The client package, imported by the entry scripts above.
+├── arm_controller.py      14 arm joints on rt/arm_sdk @ 50 Hz; body-lock, velocity clamp, kp switching.
+├── gripper_controller.py  Dex1 grippers on rt/dex1/{l,r}/cmd @ 200 Hz with a per-tick rate cap.
+├── camera_client.py       3-camera capture via teleimager, BGR->RGB resize to 256x320.
+├── policy_client.py       WebSocket client for the LingBot-VA server (msgpack wire format).
+└── msgpack_numpy.py       NumPy support for msgpack — must mirror the server's module.
+```
+
+`main.py` / `smoke_test.py` are run directly from the repo root (`python main.py`);
+they import the `g1_client` package. Running them as `python -m ...` will not work.
 
 See [`CLAUDE.md`](CLAUDE.md) for the full architecture write-up — action tensor
 layout, chunk cadence, the `arm_sdk` handover, shutdown ordering, and more.
