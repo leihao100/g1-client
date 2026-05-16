@@ -278,13 +278,28 @@ class ArmController:
 
         The _cmd_lock keeps this CRC-safe even if the publish thread is somehow
         still running (it normally is not — stop() joins it first).
+
+        A `try`/`finally` wraps the ramp so a KeyboardInterrupt landing inside
+        one of the `time.sleep(0.02)` calls cannot leave q[29] latched at an
+        intermediate value: the finally block always writes q=0 one final time.
+        Without this, a second Ctrl+C during the ~1 s ramp would leave the
+        loco service blind to the handover release.
         """
-        for w in np.linspace(1.0, 0.0, 50):
+        try:
+            for w in np.linspace(1.0, 0.0, 50):
+                with self._cmd_lock:
+                    self.cmd.motor_cmd[G1JointIndex.kNotUsedJoint].q = float(w)
+                    self.cmd.crc = self.crc.Crc(self.cmd)
+                    self.pub.Write(self.cmd)
+                time.sleep(0.02)
+        finally:
+            # Guaranteed terminal q=0 write — runs even if the ramp above was
+            # interrupted mid-sleep by KeyboardInterrupt, so arm_sdk always
+            # ends at 0 and the loco service reliably regains authority.
             with self._cmd_lock:
-                self.cmd.motor_cmd[G1JointIndex.kNotUsedJoint].q = float(w)
+                self.cmd.motor_cmd[G1JointIndex.kNotUsedJoint].q = 0.0
                 self.cmd.crc = self.crc.Crc(self.cmd)
                 self.pub.Write(self.cmd)
-            time.sleep(0.02)
 
     # ---------- internals ----------
 

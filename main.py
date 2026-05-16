@@ -260,20 +260,45 @@ def _run_inference_loop(arm, grip, cam, policy, args) -> None:
 
 
 def _cleanup(arm, grip, cam, policy) -> None:
+    """Release every resource we may have acquired. Each step is isolated in
+    its own try/except BaseException so a KeyboardInterrupt (e.g. a second
+    Ctrl+C during shutdown) cannot skip later steps — most critically, it
+    cannot skip disable_arm_sdk, which is the only thing returning arm
+    authority to the locomotion service.
+
+    BaseException (not Exception) is required: KeyboardInterrupt inherits
+    from BaseException, so a plain `except Exception` would let a second
+    Ctrl+C escape and abort the rest of cleanup. SystemExit is also caught
+    by this same guard, which is the intended behaviour for shutdown.
+    """
     log.info("Shutting down — releasing arm_sdk")
     # Stop publish loop FIRST so disable_arm_sdk has exclusive access to
-    # self.cmd / self.pub — otherwise the two threads race on CRC.
-    arm.stop()
+    # self.cmd / self.pub. If the join is interrupted by Ctrl+C we still
+    # fall through to disable_arm_sdk: the _cmd_lock makes a concurrent
+    # write CRC-safe, and disable_arm_sdk's own finally guarantees q=0.
+    try:
+        arm.stop()
+    except BaseException as e:
+        log.warning(f"arm.stop() failed: {e}")
     try:
         arm.disable_arm_sdk()
-    except Exception as e:
+    except BaseException as e:
         log.warning(f"disable_arm_sdk failed: {e}")
     if grip is not None:
-        grip.stop()
+        try:
+            grip.stop()
+        except BaseException as e:
+            log.warning(f"grip.stop() failed: {e}")
     if cam is not None:
-        cam.close()
+        try:
+            cam.close()
+        except BaseException as e:
+            log.warning(f"cam.close() failed: {e}")
     if policy is not None:
-        policy.close()
+        try:
+            policy.close()
+        except BaseException as e:
+            log.warning(f"policy.close() failed: {e}")
 
 
 def run(args):

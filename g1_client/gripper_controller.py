@@ -78,7 +78,29 @@ class GripperController:
         self._pub_thread.start()
 
     def stop(self):
+        """Stop the publish thread cleanly.
+
+        Before signaling stop, overwrite the target with the current measured
+        position so the last few frames the publish thread sends are hold-in-
+        place rather than continuing to drive toward whatever the model last
+        commanded — which is frequently a closing grip on an object. The
+        publish thread's per-tick rate cap (DELTA_GRIPPER_CMD) means a single
+        frame can't snap the gripper anywhere; the parked target just stops it
+        moving further once the stop signal is honored.
+
+        Then join the publish thread (with a short timeout) so we don't leave
+        a daemon thread still writing as the process exits.
+        """
+        with self._state_lock:
+            lq, rq = self._left_q, self._right_q
+        with self._target_lock:
+            self._left_target = lq
+            self._right_target = rq
         self._stop.set()
+        if self._pub_thread.is_alive():
+            self._pub_thread.join(timeout=1.0)
+        if self._sub_thread.is_alive():
+            self._sub_thread.join(timeout=1.0)
 
     def set_targets(self, left: float, right: float):
         left = float(np.clip(left, GRIPPER_MIN, GRIPPER_MAX))
