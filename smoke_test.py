@@ -12,6 +12,7 @@ Usage (run directly from inside the lingbot_g1_client/ directory):
 import argparse
 import logging
 
+import cv2
 import numpy as np
 
 from g1_client.policy_client import PolicyClient
@@ -23,7 +24,13 @@ log = logging.getLogger("lingbot_g1.smoke")
 
 
 def fake_obs(prompt: str) -> dict:
-    img = lambda: (np.random.rand(256, 320, 3) * 255).astype(np.uint8)
+    # Match the live wire format: 256x320 BGR JPEG bytes (q90), server decodes.
+    def img() -> bytes:
+        arr = (np.random.rand(256, 320, 3) * 255).astype(np.uint8)
+        ok, buf = cv2.imencode(".jpg", arr, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        if not ok:
+            raise RuntimeError("cv2.imencode failed")
+        return buf.tobytes()
     return {
         "observation.images.cam_left_high":   img(),
         "observation.images.cam_left_wrist":  img(),

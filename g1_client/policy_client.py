@@ -20,6 +20,7 @@ class PolicyClient:
             self._uri += f":{port}"
         self._packer = Packer()
         self._api_key = api_key
+        self.last_timing: Optional[Dict] = None
         self._ws, self._server_metadata = self._wait_for_server()
 
     def get_server_metadata(self) -> Dict:
@@ -45,12 +46,32 @@ class PolicyClient:
                 time.sleep(5)
 
     def infer(self, obs: Dict) -> Dict:
+        t0 = time.perf_counter()
         data = self._packer.pack(obs)
+        t_pack = time.perf_counter()
         self._ws.send(data)
+        t_send = time.perf_counter()
         response = self._ws.recv()
+        t_recv = time.perf_counter()
         if isinstance(response, str):
             raise RuntimeError(f"Error in inference server:\n{response}")
-        return unpackb(response)
+        result = unpackb(response)
+        t_unpack = time.perf_counter()
+
+        # Profiling breakdown for the last infer() call. wait_recv_s is the
+        # blocking recv: network-up + server compute + network-down combined.
+        # Subtract the server-measured inference time from it to isolate the
+        # network/transport cost.
+        self.last_timing = {
+            "pack_s": t_pack - t0,
+            "send_s": t_send - t_pack,
+            "wait_recv_s": t_recv - t_send,
+            "unpack_s": t_unpack - t_recv,
+            "total_s": t_unpack - t0,
+            "bytes_sent": len(data),
+            "bytes_recv": len(response) if isinstance(response, (bytes, bytearray)) else -1,
+        }
+        return result
 
     def reset(self, prompt: str) -> None:
         self.infer({"reset": True, "prompt": prompt})

@@ -47,11 +47,16 @@ log = logging.getLogger("lingbot_g1.main")
 
 
 # Cadence:
-#   frame_chunk_size = 2 latent frames per chunk
-#   action_per_frame = 16 sub-steps per latent frame  → 32 sub-steps per chunk
+#   frame_chunk_size = latent frames per chunk (server-defined; 2 for the
+#                      original g1 model, 4 for g1_500step — DERIVED from the
+#                      returned action tensor's axis 1, not hard-coded)
+#   action_per_frame = sub-steps per latent frame (derived from axis 2)
 #   sub-step rate    = ~30 Hz (33.3 ms each)
-#   capture cadence  = every 4 sub-steps → 8 keyframes per chunk
+#   capture cadence  = every CAPTURE_EVERY sub-steps → keyframes scale with
+#                      the chunk size automatically
 CAPTURE_EVERY = 4
+# Nominal values for the original g1 model — kept only so a horizon change
+# from the server is logged as a notice, not silently accepted.
 FRAME_CHUNK = 2
 SUBSTEPS_PER_FRAME = 16
 
@@ -87,23 +92,40 @@ def log_chunk_summary(chunk_id, action):
 
 def execute_chunk(action, arm_ctrl, grip_ctrl, cam_client, is_first_chunk,
                   substep_dt=1.0 / 30.0, verbose_substeps=True):
-    """Dispatch one [16, 2, 16] action chunk to arms+grippers at 30 Hz.
+    """Dispatch one [16, F, S] action chunk to arms+grippers at 30 Hz.
 
-    Returns the captured keyframes — 8 per chunk, except the first chunk
-    where frame 0 is skipped → 4. Each keyframe is the camera-only image
-    dict (no prompt key), ready to ship back as part of compute_kv_cache.
+    F (frames/chunk) and S (sub-steps/frame) are taken from the action
+    tensor, not assumed — the server's horizon (e.g. F=2 for g1, F=4 for
+    g1_500step) can change without a client edit.
+
+    Returns (keyframes, stats). A keyframe is captured every CAPTURE_EVERY
+    sub-steps, so the count scales with the chunk: F*S/CAPTURE_EVERY for
+    chunks 1+, (F-1)*S/CAPTURE_EVERY for chunk 0 (frame 0 skipped). Each is
+    the camera-only image dict (no prompt key), shipped back in
+    compute_kv_cache. stats — per-substep pacing profile.
 
     For the first chunk only, skip frame 0's sub-steps (the model treats
     them as 'observe the start position').
     """
-    assert action.shape == (16, FRAME_CHUNK, SUBSTEPS_PER_FRAME), \
-        f"Unexpected action shape {action.shape}"
+    assert action.ndim == 3 and action.shape[0] == 16, \
+        f"Unexpected action shape {action.shape} (want (16, F, S))"
+    n_frames = action.shape[1]
+    n_sub = action.shape[2]
+    if (n_frames, n_sub) != (FRAME_CHUNK, SUBSTEPS_PER_FRAME):
+        log.info(f"Server horizon is {n_frames}x{n_sub} sub-steps/chunk "
+                 f"(nominal {FRAME_CHUNK}x{SUBSTEPS_PER_FRAME}) — adapting; "
+                 f"keyframes/chunk now scale accordingly")
 
     keyframes = []
     start_frame = 1 if is_first_chunk else 0
 
-    for t in range(start_frame, FRAME_CHUNK):
-        for f in range(SUBSTEPS_PER_FRAME):
+    n_substeps = 0
+    n_overrun = 0
+    max_elapsed = 0.0
+    cam_total = 0.0
+
+    for t in range(start_frame, n_frames):
+        for f in range(n_sub):
             # Abort fast if the arm's publish thread died — otherwise we keep
             # dispatching targets nobody is sending, with arm_sdk still latched.
             if arm_ctrl.faulted():
@@ -130,16 +152,28 @@ def execute_chunk(action, arm_ctrl, grip_ctrl, cam_client, is_first_chunk,
             # (f=3,7,11,15 — late in the window so motion has had time to settle).
             if (f + 1) % CAPTURE_EVERY == 0:
                 try:
+                    cap_tic = time.time()
                     keyframes.append(cam_client.get_obs_images())
+                    cam_total += time.time() - cap_tic
                 except Exception as e:
                     log.warning(f"Camera capture failed at frame={t} sub={f}: {e}")
 
             elapsed = time.time() - tic
+            n_substeps += 1
+            max_elapsed = max(max_elapsed, elapsed)
+            if elapsed > substep_dt:
+                n_overrun += 1
             sleep = substep_dt - elapsed
             if sleep > 0:
                 time.sleep(sleep)
 
-    return keyframes
+    stats = {
+        "n_substeps": n_substeps,
+        "n_overrun": n_overrun,
+        "max_substep_s": max_elapsed,
+        "keyframe_cam_s": cam_total,
+    }
+    return keyframes, stats
 
 
 # ---------- pipeline stages ----------
@@ -210,15 +244,32 @@ def _connect_policy(args) -> PolicyClient:
     return policy
 
 
-def _request_action(policy, cam, args) -> np.ndarray:
-    """Send a fresh obs + prompt to the policy and return the action tensor."""
+def _fmt_infer_timing(label, t):
+    """One-line breakdown of a PolicyClient.last_timing dict."""
+    if t is None:
+        return f"{label}: <no timing>"
+    return (f"{label}: total={t['total_s']*1e3:7.1f}ms "
+            f"(pack={t['pack_s']*1e3:5.1f} send={t['send_s']*1e3:5.1f} "
+            f"wait_recv={t['wait_recv_s']*1e3:7.1f} unpack={t['unpack_s']*1e3:5.1f}) "
+            f"up={t['bytes_sent']/1024:.0f}KiB down={t['bytes_recv']/1024:.0f}KiB")
+
+
+def _request_action(policy, cam, args):
+    """Send a fresh obs + prompt to the policy.
+
+    Returns (action, cam_build_s). policy.last_timing carries the wire-level
+    breakdown of the infer() round-trip.
+    """
+    cam_tic = time.time()
+    obs = cam.get_obs(args.prompt)
+    cam_build_s = time.time() - cam_tic
     result = policy.infer({
-        "obs": cam.get_obs(args.prompt),
+        "obs": obs,
         "prompt": args.prompt,
         "video_guidance_scale": args.video_guidance,
         "action_guidance_scale": args.action_guidance,
     })
-    return result["action"]
+    return result["action"], cam_build_s
 
 
 def _run_inference_loop(arm, grip, cam, policy, args) -> None:
@@ -227,15 +278,20 @@ def _run_inference_loop(arm, grip, cam, policy, args) -> None:
 
     chunk_id = 0
     log.info(f"[chunk {chunk_id}] sending initial obs")
-    action = _request_action(policy, cam, args)
+    action, cam_build_s = _request_action(policy, cam, args)
     log.info(f"[chunk {chunk_id}] got action {action.shape}")
+    log.info(f"[chunk {chunk_id}] cam_build={cam_build_s*1e3:.1f}ms  "
+             + _fmt_infer_timing("request_action", policy.last_timing))
     log_chunk_summary(chunk_id, action)
 
     while chunk_id < args.max_chunks:
-        keyframes = execute_chunk(action, arm, grip, cam,
-                                  is_first_chunk=(chunk_id == 0),
-                                  substep_dt=1.0 / args.substep_hz,
-                                  verbose_substeps=not args.quiet_substeps)
+        exec_tic = time.time()
+        keyframes, exec_stats = execute_chunk(
+            action, arm, grip, cam,
+            is_first_chunk=(chunk_id == 0),
+            substep_dt=1.0 / args.substep_hz,
+            verbose_substeps=not args.quiet_substeps)
+        exec_s = time.time() - exec_tic
 
         # Hand the just-executed action + keyframes back so the server's
         # KV cache reflects reality before the next infer().
@@ -244,6 +300,13 @@ def _run_inference_loop(arm, grip, cam, policy, args) -> None:
             "compute_kv_cache": True,
             "state": action,
         })
+        log.info(
+            f"[chunk {chunk_id}] execute={exec_s:6.3f}s "
+            f"(robot motion ~{exec_stats['n_substeps']/args.substep_hz:.2f}s, "
+            f"overruns={exec_stats['n_overrun']}/{exec_stats['n_substeps']}, "
+            f"max_substep={exec_stats['max_substep_s']*1e3:.1f}ms, "
+            f"keyframe_cam={exec_stats['keyframe_cam_s']*1e3:.1f}ms)  "
+            + _fmt_infer_timing("kv_cache", policy.last_timing))
 
         chunk_id += 1
         if chunk_id >= args.max_chunks:
@@ -254,8 +317,13 @@ def _run_inference_loop(arm, grip, cam, policy, args) -> None:
         # autoregression but we send a fresh capture in case the server
         # uses it for sanity logging.
         log.info(f"[chunk {chunk_id}] requesting next action")
-        action = _request_action(policy, cam, args)
+        req_tic = time.time()
+        action, cam_build_s = _request_action(policy, cam, args)
+        req_s = time.time() - req_tic
         log.info(f"[chunk {chunk_id}] got action {action.shape}")
+        log.info(f"[chunk {chunk_id}] request_total={req_s:6.3f}s "
+                 f"cam_build={cam_build_s*1e3:.1f}ms  "
+                 + _fmt_infer_timing("request_action", policy.last_timing))
         log_chunk_summary(chunk_id, action)
 
 
