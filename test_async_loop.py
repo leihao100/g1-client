@@ -4,19 +4,22 @@ No server, no robot, no DDS — injects fakes for arm/grip/cam/policy/args and
 drives _run_inference_loop, asserting the EXACT wire schedule:
 
   reset(prompt)
-  cold_start(obs=<single dict>)            -> {action: C0, action1: C1}
-  per cycle n=1..max_chunks:
-     async_step(obs=K_{n-1}, state=a_{n-1}, executing_action=C_n) -> {action: C_{n+1}}
+  cold_start(obs=<single dict>)            -> {action: C0}  (single chunk)
+  cycle 0: async_step(executing_action=C0)          -> {action: C1}
+  cycle n≥1: async_step(obs=K_{n-1}, state=C_{n-1}, executing_action=C_n)
+                                                    -> {action: C_{n+1}}
 
 Pins the silent-desync-class invariants:
   * message kinds are exactly {reset, cold_start, async_step} — never
     compute_kv_cache, never a plain {obs,prompt} infer
-  * cold_start obs is a single dict (1 frame); async_step obs is a list,
-    length 4 on the FIRST async_step (C0 ran is_first_chunk=True), 8 after
+  * cold_start returns ONLY 'action' (no 'action1'); obs is a single dict
+  * cycle 0 async_step carries NO obs/state (server grounds z_0 itself);
+    cycle n≥1 obs is a list, length 4 on the first grounding cycle (C0 ran
+    is_first_chunk=True), 8 after
   * state / executing_action are the SAME ndarray objects the fake server
     returned (verbatim pass-through, no copy/reshape/renorm)
-  * one-cycle lag/rotation: at cycle n, state == chunk executed at n-1,
-    executing_action == chunk executed at n, obs == keyframes from n-1
+  * one-cycle lag/rotation: at cycle n, executing_action == chunk executed
+    at n; from cycle 1, state == chunk executed at n-1, obs == its keyframes
   * the async_step request runs on a NON-main (daemon) thread
 
 Run:  conda activate unitree_deploy && python test_async_loop.py
@@ -82,7 +85,7 @@ class FakePolicy:
             return {}
         if payload.get("cold_start"):
             self.calls.append(("cold_start", payload, ident))
-            return {"action": self._chunk(), "action1": self._chunk()}
+            return {"action": self._chunk()}  # single-chunk cold start
         if payload.get("async_step"):
             self.calls.append(("async_step", payload, ident))
             return {"action": self._chunk()}
@@ -115,57 +118,68 @@ def main():
     assert kinds == ["reset", "cold_start"] + ["async_step"] * N, \
         f"wrong message schedule: {kinds}"
 
-    # 2. no forbidden messages anywhere
+    # 2. no forbidden messages anywhere; executing_action always present
     for k, p, _ in pol.calls:
         assert "compute_kv_cache" not in p, "compute_kv_cache must not appear in async path"
         if k == "async_step":
-            assert set(p) >= {"async_step", "obs", "state", "executing_action"}, \
+            assert "async_step" in p and "executing_action" in p, \
                 f"async_step missing keys: {sorted(p)}"
             assert "prompt" not in p, "async_step must not carry prompt"
 
-    # 3. cold_start obs is a SINGLE dict (1 frame), not a list
+    # 3. cold_start: SINGLE dict obs, returns ONLY 'action' (no 'action1')
     _, cs_payload, cs_ident = pol.calls[1]
     assert isinstance(cs_payload["obs"], dict), \
         f"cold_start obs must be a dict, got {type(cs_payload['obs'])}"
     assert cs_ident == MAIN_IDENT, "cold_start must run on the main thread"
     assert pol.calls[0][2] == MAIN_IDENT, "reset must run on the main thread"
 
-    # server's two cold-start chunks
-    C0, C1 = pol.returned[0], pol.returned[1]
+    # pol.returned[0]=C0 (cold start); async_step #i returns returned[i+1].
+    C0 = pol.returned[0]
 
     # 4. per-cycle async_step contract: keyframe count, rotation, identity, thread
     async_calls = pol.calls[2:]
-    for i, (_, p, ident) in enumerate(async_calls):  # i=0 is the FIRST async_step
-        # 4a. keyframe count: 4 on the first (C0 ran is_first_chunk=True), 8 after
-        expected_kf = 4 if i == 0 else 8
-        assert isinstance(p["obs"], list), "async_step obs must be a list"
-        assert len(p["obs"]) == expected_kf, \
-            f"async_step #{i}: obs has {len(p['obs'])} keyframes, expected {expected_kf}"
+    for i, (_, p, ident) in enumerate(async_calls):  # i = cycle index
+        executing = pol.returned[i]       # cycle i executes C_i (C0 at i=0)
+        returns = pol.returned[i + 1]     # and the server hands back C_{i+1}
 
-        # 4b. rotation + verbatim identity pass-through
-        executed_this_cycle = pol.returned[i + 1]   # C1 at i=0, then C2, C3, ...
-        executed_prev_cycle = pol.returned[i]       # C0 at i=0, then C1, C2, ...
-        assert p["executing_action"] is executed_this_cycle, \
-            f"async_step #{i}: executing_action is not the chunk running this cycle (identity)"
-        assert p["state"] is executed_prev_cycle, \
-            f"async_step #{i}: state is not the previous executed chunk (identity)"
+        # 4a. executing_action is verbatim the chunk running this cycle
+        assert p["executing_action"] is executing, \
+            f"async_step #{i}: executing_action is not the chunk running this cycle"
+
+        if i == 0:
+            # cycle 0: NO real feedback yet — server grounds z_0 itself.
+            assert "obs" not in p and "state" not in p, \
+                f"cycle 0 async_step must omit obs/state, got {sorted(p)}"
+        else:
+            # cycle n≥1: ground C_{n-1}. 4 keyframes on the first grounding
+            # cycle (C0 ran is_first_chunk=True → frame 0 skipped), 8 after.
+            expected_kf = 4 if i == 1 else 8
+            assert isinstance(p["obs"], list), "async_step obs must be a list"
+            assert len(p["obs"]) == expected_kf, \
+                f"async_step #{i}: obs has {len(p['obs'])} keyframes, expected {expected_kf}"
+            assert p["state"] is pol.returned[i - 1], \
+                f"async_step #{i}: state is not the previous executed chunk (identity)"
 
         # 4c. request runs OFF the main thread (Branch B daemon)
         assert ident != MAIN_IDENT, \
             f"async_step #{i} ran on the main thread; must be a daemon thread"
 
-    # explicit spelling-out of the first cycle (the one most prone to desync)
-    assert async_calls[0][1]["state"] is C0, "first async_step must ground C0"
-    assert async_calls[0][1]["executing_action"] is C1, \
-        "first async_step must report C1 as executing"
-    assert len(async_calls[0][1]["obs"]) == 4, \
-        "first async_step must carry exactly 4 keyframes (C0 frame-0 skipped)"
+    # explicit spelling-out of the first two cycles (most prone to desync)
+    assert "state" not in async_calls[0][1] and "obs" not in async_calls[0][1], \
+        "cycle 0 must carry no obs/state (server _ground_init's z_0)"
+    assert async_calls[0][1]["executing_action"] is C0, \
+        "cycle 0 must report C0 as executing"
+    assert async_calls[1][1]["state"] is C0, "cycle 1 must ground C0"
+    assert len(async_calls[1][1]["obs"]) == 4, \
+        "cycle 1 must carry exactly 4 keyframes (C0 frame-0 skipped)"
 
+    kf_counts = [len(p["obs"]) if "obs" in p else 0 for _, p, _ in async_calls]
     print(f"PASS — schedule {kinds}")
-    print(f"PASS — cold_start obs is a single dict; reset/cold_start on main thread")
-    print(f"PASS — async_step keyframe counts: "
-          f"{[len(p['obs']) for _, p, _ in async_calls]} (expect [4,8,8,8,8])")
-    print(f"PASS — state/executing_action identity rotation holds for {N} cycles")
+    print(f"PASS — single-chunk cold_start (no 'action1'); obs a single dict; "
+          f"reset/cold_start on main thread")
+    print(f"PASS — cycle 0 carries no obs/state; later keyframe counts: "
+          f"{kf_counts} (expect [0,4,8,8,8])")
+    print(f"PASS — executing_action/state identity rotation holds for {N} cycles")
     print(f"PASS — all {N} async_step requests ran off the main thread")
     return 0
 

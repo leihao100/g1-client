@@ -9,14 +9,17 @@ Pipeline:
   3. STANDBY: hold the ready pose until the operator presses Enter.
   4. Switch arm kp from the stiff init value to the softer inference value.
   5. Connect to the cloud WebSocket server, send reset({prompt}).
-  6. Loop per chunk:
-       a. infer({obs, prompt}) → action [16, 2, 16].
-       b. Iterate frames × sub_steps, dispatch targets at 30 Hz.
-       c. Every CAPTURE_EVERY sub-steps snap a keyframe — 8 per chunk,
-          except the first chunk where frame 0 is skipped → 4 keyframes.
-       d. compute_kv_cache: hand the keyframes + executed action back so
-          the server's KV cache reflects reality.
-       e. Request the next chunk and repeat.
+  6. cold_start → TWO chunks C0, C1 (Algorithm 2, buffered). C1 is the
+     pipeline buffer that keeps the steady loop overlapped; it is
+     FDM-grounded on z_0 server-side (accurate opening).
+  7. Execute C0 (the one non-overlapped chunk, is_first → 4 keyframes).
+  8. Overlapped loop per chunk (Branch A ‖ Branch B):
+       A. execute the current chunk at 30 Hz; every CAPTURE_EVERY
+          sub-steps snap a keyframe — 8 per chunk.
+       B. on a daemon thread, async_step({obs:K_{n-1}, state:a_{n-1},
+          executing_action:C_n}) → next chunk; the server grounds the
+          previous chunk's reality, FDM-imagines C_n, predicts C_{n+1}.
+       Join B, rotate, repeat.
 
 Usage (run directly from inside the lingbot_g1_client/ directory):
     python main.py \\
@@ -278,19 +281,23 @@ def _async_step_worker(policy, prev_kf, prev_act, cur, out_q):
 
 
 def _run_inference_loop(arm, grip, cam, policy, args) -> None:
-    """Asynchronous, FDM-grounded loop (Algorithm 2).
+    """Asynchronous, FDM-grounded loop (Algorithm 2, two-chunk buffered).
 
-    reset → cold_start (TWO chunks) → the one non-overlapped chunk C0 →
-    steady loop where each cycle overlaps the async_step request (daemon
-    thread) with execute_chunk (main thread). compute_kv_cache is NOT used
+    reset → cold_start (TWO chunks: C0 to run now, C1 buffered) → execute
+    C0 (the one non-overlapped chunk) → steady loop where each cycle
+    overlaps the async_step request (daemon thread) with execute_chunk
+    (main thread). The buffered C1 keeps the steady loop one chunk ahead so
+    it stays overlapped instead of stalling. compute_kv_cache is NOT used
     in this path — grounding folds into async_step.
     """
     log.info(f"Reset with prompt: {args.prompt!r}")
     policy.reset(args.prompt)
 
-    # Cold start: ONE init frame in, TWO chunks back (C0 to execute now, C1
-    # held to execute next so the first async_step can ground C0 in parallel
-    # — a one-chunk cold start would force C0 to be grounded twice).
+    # Cold start: ONE init frame in, TWO chunks back. C0 runs now; C1 is
+    # buffered so the first async_step can ground C0's real feedback while
+    # the robot executes C1 (the pipeline buffer that keeps the overlapped
+    # loop from stalling). C1 is FDM-grounded on z_0 server-side (chunk
+    # 1), not an ungrounded rollout — so the opening stays accurate.
     log.info("Cold start: sending one init frame, expecting two chunks")
     init = cam.get_obs(args.prompt)
     resp = policy.infer({"cold_start": True, "obs": init})
