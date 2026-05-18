@@ -28,7 +28,9 @@ Usage (run directly from inside the lingbot_g1_client/ directory):
 
 import argparse
 import logging
+import queue
 import sys
+import threading
 import time
 
 import numpy as np
@@ -254,77 +256,93 @@ def _fmt_infer_timing(label, t):
             f"up={t['bytes_sent']/1024:.0f}KiB down={t['bytes_recv']/1024:.0f}KiB")
 
 
-def _request_action(policy, cam, args):
-    """Send a fresh obs + prompt to the policy.
+def _async_step_worker(policy, prev_kf, prev_act, cur, out_q):
+    """Branch B: the single blocking async_step request, run on a daemon
+    thread so it overlaps Branch A (execute_chunk on the main thread).
 
-    Returns (action, cam_build_s). policy.last_timing carries the wire-level
-    breakdown of the infer() round-trip.
+    Sends the PREVIOUS chunk's keyframes + the just-executed action to be
+    grounded, plus the chunk executing right now (for the server's FDM
+    "imagine the executing chunk" pass). state/executing_action are passed
+    through verbatim — the server runs its own preprocess_action.
     """
-    cam_tic = time.time()
-    obs = cam.get_obs(args.prompt)
-    cam_build_s = time.time() - cam_tic
-    result = policy.infer({
-        "obs": obs,
-        "prompt": args.prompt,
-        "video_guidance_scale": args.video_guidance,
-        "action_guidance_scale": args.action_guidance,
-    })
-    return result["action"], cam_build_s
+    try:
+        resp = policy.infer({
+            "async_step": True,
+            "obs": prev_kf,           # K_{n-1}
+            "state": prev_act,        # a_{n-1}, verbatim
+            "executing_action": cur,  # C_n,    verbatim
+        })
+        out_q.put(("ok", resp))
+    except BaseException as e:  # surface daemon failure to the main thread
+        out_q.put(("err", e))
 
 
 def _run_inference_loop(arm, grip, cam, policy, args) -> None:
+    """Asynchronous, FDM-grounded loop (Algorithm 2).
+
+    reset → cold_start (TWO chunks) → the one non-overlapped chunk C0 →
+    steady loop where each cycle overlaps the async_step request (daemon
+    thread) with execute_chunk (main thread). compute_kv_cache is NOT used
+    in this path — grounding folds into async_step.
+    """
     log.info(f"Reset with prompt: {args.prompt!r}")
     policy.reset(args.prompt)
 
-    chunk_id = 0
-    log.info(f"[chunk {chunk_id}] sending initial obs")
-    action, cam_build_s = _request_action(policy, cam, args)
-    log.info(f"[chunk {chunk_id}] got action {action.shape}")
-    log.info(f"[chunk {chunk_id}] cam_build={cam_build_s*1e3:.1f}ms  "
-             + _fmt_infer_timing("request_action", policy.last_timing))
-    log_chunk_summary(chunk_id, action)
+    # Cold start: ONE init frame in, TWO chunks back (C0 to execute now, C1
+    # held to execute next so the first async_step can ground C0 in parallel
+    # — a one-chunk cold start would force C0 to be grounded twice).
+    log.info("Cold start: sending one init frame, expecting two chunks")
+    init = cam.get_obs(args.prompt)
+    resp = policy.infer({"cold_start": True, "obs": init})
+    C0, C1 = resp["action"], resp["action1"]
+    log.info(f"Cold start returned C0 {C0.shape}, C1 {C1.shape}")
+    log_chunk_summary(0, C0)
 
-    while chunk_id < args.max_chunks:
+    # The ONE non-overlapped chunk. C0 ran is_first_chunk=True → frame 0
+    # skipped → 4 keyframes. Nothing to overlap it against yet.
+    exec_tic = time.time()
+    K0, st = execute_chunk(C0, arm, grip, cam, is_first_chunk=True,
+                           substep_dt=1.0 / args.substep_hz,
+                           verbose_substeps=not args.quiet_substeps)
+    log.info(f"[cycle 0] C0 execute={time.time()-exec_tic:6.3f}s "
+             f"keyframes={len(K0)} (expect 4)")
+
+    prev_kf, prev_act = K0, C0
+    cur = C1  # the chunk to execute next
+
+    for n in range(1, args.max_chunks + 1):
+        out_q = queue.Queue()
+        th = threading.Thread(
+            target=_async_step_worker,
+            args=(policy, prev_kf, prev_act, cur, out_q),
+            daemon=True, name=f"async_step-{n}")
+        th.start()  # Branch B fires; do NOT block main on it
+
+        # Branch A: execute the current chunk at 30 Hz on the main thread.
+        # Steady chunks run is_first_chunk=False → 8 keyframes.
         exec_tic = time.time()
-        keyframes, exec_stats = execute_chunk(
-            action, arm, grip, cam,
-            is_first_chunk=(chunk_id == 0),
-            substep_dt=1.0 / args.substep_hz,
-            verbose_substeps=not args.quiet_substeps)
+        Kn, st = execute_chunk(cur, arm, grip, cam, is_first_chunk=False,
+                               substep_dt=1.0 / args.substep_hz,
+                               verbose_substeps=not args.quiet_substeps)
         exec_s = time.time() - exec_tic
 
-        # Hand the just-executed action + keyframes back so the server's
-        # KV cache reflects reality before the next infer().
-        policy.infer({
-            "obs": keyframes,
-            "compute_kv_cache": True,
-            "state": action,
-        })
+        status, payload = out_q.get()  # join: block until the request returns
+        th.join()
+        if status == "err":
+            raise payload
+        next_chunk = payload["action"]
+
         log.info(
-            f"[chunk {chunk_id}] execute={exec_s:6.3f}s "
-            f"(robot motion ~{exec_stats['n_substeps']/args.substep_hz:.2f}s, "
-            f"overruns={exec_stats['n_overrun']}/{exec_stats['n_substeps']}, "
-            f"max_substep={exec_stats['max_substep_s']*1e3:.1f}ms, "
-            f"keyframe_cam={exec_stats['keyframe_cam_s']*1e3:.1f}ms)  "
-            + _fmt_infer_timing("kv_cache", policy.last_timing))
+            f"[cycle {n}] execute={exec_s:6.3f}s "
+            f"(motion ~{st['n_substeps']/args.substep_hz:.2f}s, "
+            f"overruns={st['n_overrun']}/{st['n_substeps']}, "
+            f"keyframes={len(Kn)})  "
+            + _fmt_infer_timing("async_step", policy.last_timing))
+        log_chunk_summary(n, next_chunk)
 
-        chunk_id += 1
-        if chunk_id >= args.max_chunks:
-            break
-
-        # Request next chunk. Note: after the first chunk, the model uses
-        # its KV cache as context — the obs field isn't strictly needed for
-        # autoregression but we send a fresh capture in case the server
-        # uses it for sanity logging.
-        log.info(f"[chunk {chunk_id}] requesting next action")
-        req_tic = time.time()
-        action, cam_build_s = _request_action(policy, cam, args)
-        req_s = time.time() - req_tic
-        log.info(f"[chunk {chunk_id}] got action {action.shape}")
-        log.info(f"[chunk {chunk_id}] request_total={req_s:6.3f}s "
-                 f"cam_build={cam_build_s*1e3:.1f}ms  "
-                 + _fmt_infer_timing("request_action", policy.last_timing))
-        log_chunk_summary(chunk_id, action)
+        # Rotate: this cycle's keyframes/action become next cycle's "previous"
+        # to ground; next_chunk becomes what we execute next.
+        prev_kf, prev_act, cur = Kn, cur, next_chunk
 
 
 def _cleanup(arm, grip, cam, policy) -> None:
