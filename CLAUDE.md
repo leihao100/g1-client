@@ -112,9 +112,21 @@ Two subtleties that matter for safety:
 
 These cannot both be right against the same server. The tests embody the "single-chunk cold_start" protocol; `main.py` implements the "two-chunk buffered cold_start" protocol. Whichever you keep, both ends (this client *and* the server) must agree — this is the same silent-desync class as the keyframe-count and color-order contracts above.
 
-**Resolution direction.** The tests are the newer pin (added alongside the JPEG-BGR camera change). The intended convergence is for `main.py` to move to the **single-chunk cold_start** schedule the tests describe: `cold_start` returns only `C0`; cycle 0's `async_step` carries no `obs`/`state` and returns `C1`; cycle 1 grounds `C0` with 4 keyframes; cycle 2+ grounds with 8. Do *not* "fix" the tests to match `main.py`'s current two-chunk behavior — that would lock in the divergence. The right next edit is to update `_run_inference_loop` (and the matching server endpoint) to the single-chunk schedule and verify with both tests.
+**Resolution direction.** Verified against the deployed server at `/home/nuwm-1/Workspace/dev/lingbot-va/wan_va/wan_va_server.py` (cross-repo check, May 2026): the **server implements the two-chunk protocol that `main.py` matches**. Specifically:
 
-Run `python test_async_loop.py` after any change to `_run_inference_loop` to catch the schedule-level regressions; run `smoke_test.py` against the deployed server to catch the response-shape regressions.
+- `_cold_start` (`wan_va_server.py:824-862`) returns `dict(action=action0, action1=action1)` — both chunks, with `C1` FDM-grounded on `z_0` chunk-aligned.
+- `_fdm_step` (`wan_va_server.py:864-891`) calls `_compute_kv_cache(obs)` which unconditionally reads `obs['obs']` and `obs['state']`, then `preprocess_action(obs['executing_action'])`. **All three fields are required on every async_step** — there is no code path for a "cycle 0 with no obs/state."
+- The server-side test `lingbot-va/tests/test_fdm_cache_invariant.py:88-92` explicitly asserts `'action' in cs and 'action1' in cs` and replays steady-state async_step starting from `n=1` with full obs/state/executing_action.
+
+So `main.py` is **correct against the server**. The two client-side tests (`smoke_test.py`, `test_async_loop.py`) were changed in commit `f472ca5` to pin a single-chunk protocol that the server never implemented — running either of them against the real server fails (`smoke_test.py` aborts on `"action1" in r`; the cycle-0 `async_step` with no `obs`/`state` would crash the server at `KeyError: 'obs'` in `_compute_kv_cache`). The right next edit is to **revert the two client tests to the two-chunk schedule** `main.py` and the server already share. Do not change `main.py`'s `_run_inference_loop` to match the tests — that would break against the deployed server.
+
+**Status: known-but-deferred.** The production path (`main.py` ↔ g1_async server) is verified aligned and works as-is. The two broken tests are not in CI and only run when invoked manually, so leaving them mismatched does **not** break anything that ships. Two related minor items in `main.py` are also known and intentionally left alone for the same reason:
+- `_run_inference_loop`'s `for n in range(1, args.max_chunks + 1)` fires one extra `async_step` whose returned chunk is never executed — wastes one GPU inference per run, harmless.
+- `--video-guidance` / `--action-guidance` CLI args are defined but never sent in any payload — guidance is fully controlled by the server config. Dead args, harmless.
+
+Do not "clean up" any of the four items above as part of an unrelated edit. They are surface area for a focused future PR, not drive-by cleanups — touching them in passing risks reintroducing the silent-desync class.
+
+Run `python test_async_loop.py` after any change to `_run_inference_loop` to catch schedule-level regressions, but only *after* fixing the test to match the real wire — until then, the test is enforcing a fiction. Run `smoke_test.py` against the deployed server only after the same fix.
 
 # CLAUDE.md
 
