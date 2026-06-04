@@ -6,15 +6,15 @@ on, BEFORE involving the physical robot:
 
   reset(prompt)
   cold_start(obs=<single dict>)            -> {action: C0}, (16,2,16)
-  async_step(executing_action=C0)          -> {action: C1}  # cycle 0: z_0
+  async_step(executing_action=C0)          -> {action: C1}  # cycle 0: no ground
   async_step(obs=<4 kf>, state=C0, executing_action=C1) -> {action: C2}
   async_step(obs=<8 kf>, state=C1, executing_action=C2) -> {action: C3}
 
 This mirrors the first three cycles of _run_inference_loop's schedule:
-cycle 0 sends no obs/state (server grounds z_0 itself), then 4 then 8
-keyframes. It needs a running CONFIG_NAME=g1_async server reachable at
---server-host/--server-port; it cannot run without one (PolicyClient
-retries the connect forever).
+cycle 0 sends no obs/state (server skips grounding for the cold-start
+chunk), then 4 then 8 keyframes. It needs a running CONFIG_NAME=g1_async
+server reachable at --server-host/--server-port; it cannot run without one
+(PolicyClient retries the connect forever).
 
 Usage (run directly from the repo root):
     python smoke_test.py --server-host localhost --server-port 29536
@@ -98,7 +98,7 @@ def main():
     _check_chunk("cold_start C0", C0)
 
     log.info("async_step #0 (cycle 0): no obs/state, C0 executing — "
-             "server grounds z_0 and predicts C1")
+             "server skips grounding for C0 and predicts C1")
     r0 = policy.infer({"async_step": True, "executing_action": C0})
     if "action" not in r0:
         log.error(f"async_step must return 'action'; got keys={sorted(r0)}")
@@ -125,8 +125,8 @@ def main():
     _check_chunk("async_step #2 -> C3", C3)
 
     policy.close()
-    log.info("OK — single-chunk cold_start (C0); async_step #0 grounded z_0 "
-             "and returned C1; cycles #1/#2 grounded C0/C1 (4 then 8 kf)")
+    log.info("OK — single-chunk cold_start (C0); async_step #0 predicted C1 "
+             "with no grounding; cycles #1/#2 grounded C0/C1 (4 then 8 kf)")
     return 0
 
 

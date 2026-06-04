@@ -14,12 +14,18 @@ from .msgpack_numpy import Packer, unpackb
 
 class PolicyClient:
     def __init__(self, host: str = "127.0.0.1", port: Optional[int] = None,
-                 api_key: Optional[str] = None) -> None:
+                 api_key: Optional[str] = None,
+                 recv_timeout: Optional[float] = None) -> None:
         self._uri = f"ws://{host}"
         if port is not None:
             self._uri += f":{port}"
         self._packer = Packer()
         self._api_key = api_key
+        # Per-call recv ceiling. None = block forever (legacy). With a value,
+        # a stalled/half-open server (ping_interval=None can't detect a dead
+        # peer) raises TimeoutError instead of hanging the caller forever.
+        # Covers the main-thread reset/cold_start path too (no queue wrapper).
+        self._recv_timeout = recv_timeout
         self.last_timing: Optional[Dict] = None
         self._ws, self._server_metadata = self._wait_for_server()
 
@@ -51,7 +57,10 @@ class PolicyClient:
         t_pack = time.perf_counter()
         self._ws.send(data)
         t_send = time.perf_counter()
-        response = self._ws.recv()
+        # recv(timeout=) raises TimeoutError on a stalled server (websockets
+        # >= 13). Let it propagate — the caller (worker thread or main-thread
+        # reset/cold_start) turns it into a clean abort, not an infinite hang.
+        response = self._ws.recv(timeout=self._recv_timeout)
         t_recv = time.perf_counter()
         if isinstance(response, str):
             raise RuntimeError(f"Error in inference server:\n{response}")

@@ -5,17 +5,17 @@ drives _run_inference_loop, asserting the EXACT wire schedule:
 
   reset(prompt)
   cold_start(obs=<single dict>)            -> {action: C0}  (single chunk)
-  cycle 0: async_step(executing_action=C0)          -> {action: C1}
+  cycle 0:  async_step(executing_action=C0)          -> {action: C1}
   cycle n≥1: async_step(obs=K_{n-1}, state=C_{n-1}, executing_action=C_n)
-                                                    -> {action: C_{n+1}}
+                                                     -> {action: C_{n+1}}
 
 Pins the silent-desync-class invariants:
   * message kinds are exactly {reset, cold_start, async_step} — never
     compute_kv_cache, never a plain {obs,prompt} infer
   * cold_start returns ONLY 'action' (no 'action1'); obs is a single dict
-  * cycle 0 async_step carries NO obs/state (server grounds z_0 itself);
-    cycle n≥1 obs is a list, length 4 on the first grounding cycle (C0 ran
-    is_first_chunk=True), 8 after
+  * cycle 0 async_step carries NO obs/state (server skips grounding for the
+    cold-start chunk); cycle n≥1 obs is a list, length 4 on the first
+    grounding cycle (C0 ran is_first_chunk=True), 8 after
   * state / executing_action are the SAME ndarray objects the fake server
     returned (verbatim pass-through, no copy/reshape/renorm)
   * one-cycle lag/rotation: at cycle n, executing_action == chunk executed
@@ -147,7 +147,7 @@ def main():
             f"async_step #{i}: executing_action is not the chunk running this cycle"
 
         if i == 0:
-            # cycle 0: NO real feedback yet — server grounds z_0 itself.
+            # cycle 0: NO grounding for the cold-start chunk — no obs/state.
             assert "obs" not in p and "state" not in p, \
                 f"cycle 0 async_step must omit obs/state, got {sorted(p)}"
         else:
@@ -166,7 +166,7 @@ def main():
 
     # explicit spelling-out of the first two cycles (most prone to desync)
     assert "state" not in async_calls[0][1] and "obs" not in async_calls[0][1], \
-        "cycle 0 must carry no obs/state (server _ground_init's z_0)"
+        "cycle 0 must carry no obs/state (server skips grounding for C0)"
     assert async_calls[0][1]["executing_action"] is C0, \
         "cycle 0 must report C0 as executing"
     assert async_calls[1][1]["state"] is C0, "cycle 1 must ground C0"

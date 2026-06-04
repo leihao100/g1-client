@@ -9,16 +9,16 @@ Pipeline:
   3. STANDBY: hold the ready pose until the operator presses Enter.
   4. Switch arm kp from the stiff init value to the softer inference value.
   5. Connect to the cloud WebSocket server, send reset({prompt}).
-  6. cold_start → TWO chunks C0, C1 (Algorithm 2, buffered). C1 is the
-     pipeline buffer that keeps the steady loop overlapped; it is
-     FDM-grounded on z_0 server-side (accurate opening).
-  7. Execute C0 (the one non-overlapped chunk, is_first → 4 keyframes).
-  8. Overlapped loop per chunk (Branch A ‖ Branch B):
+  6. cold_start → ONE chunk C0 (Algorithm 2, single-chunk).
+  7. Overlapped loop per chunk, from cycle 0 (Branch A ‖ Branch B):
        A. execute the current chunk at 30 Hz; every CAPTURE_EVERY
-          sub-steps snap a keyframe — 8 per chunk.
-       B. on a daemon thread, async_step({obs:K_{n-1}, state:a_{n-1},
-          executing_action:C_n}) → next chunk; the server grounds the
-          previous chunk's reality, FDM-imagines C_n, predicts C_{n+1}.
+          sub-steps snap a keyframe — cycle 0 skips frame 0 → 4
+          keyframes, cycle n≥1 → 8.
+       B. on a daemon thread, async_step({executing_action:C_n
+          [, obs:K_{n-1}, state:a_{n-1}]}) → next chunk. Cycle 0 sends
+          no obs/state — the server skips grounding for C0, FDM-imagines
+          C0 (z_0 pinned), predicts C1. Cycle n≥1 grounds C_{n-1}'s
+          reality, FDM-imagines C_n, predicts C_{n+1}.
        Join B, rotate, repeat.
 
 Usage (run directly from inside the lingbot_g1_client/ directory):
@@ -31,10 +31,14 @@ Usage (run directly from inside the lingbot_g1_client/ directory):
 
 import argparse
 import logging
+import os
 import queue
+import select
 import sys
+import termios
 import threading
 import time
+import tty
 
 import numpy as np
 
@@ -156,12 +160,20 @@ def execute_chunk(action, arm_ctrl, grip_ctrl, cam_client, is_first_chunk,
             # Snap a keyframe at the end of each CAPTURE_EVERY-step window
             # (f=3,7,11,15 — late in the window so motion has had time to settle).
             if (f + 1) % CAPTURE_EVERY == 0:
+                cap_tic = time.time()
                 try:
-                    cap_tic = time.time()
-                    keyframes.append(cam_client.get_obs_images())
-                    cam_total += time.time() - cap_tic
+                    kf = cam_client.get_obs_images()
                 except Exception as e:
-                    log.warning(f"Camera capture failed at frame={t} sub={f}: {e}")
+                    # Fail loud: a swallowed capture shortens the keyframe
+                    # list, which silently desyncs the server's grounding/KV
+                    # for the active horizon (no error, just drift). Abort so
+                    # run()'s finally releases arm_sdk instead.
+                    raise RuntimeError(
+                        f"Camera capture failed at frame={t} sub={f}: {e!r} — "
+                        f"aborting rather than shipping a short keyframe list "
+                        f"(silent server desync)") from e
+                keyframes.append(kf)
+                cam_total += time.time() - cap_tic
 
             elapsed = time.time() - tic
             n_substeps += 1
@@ -171,6 +183,16 @@ def execute_chunk(action, arm_ctrl, grip_ctrl, cam_client, is_first_chunk,
             sleep = substep_dt - elapsed
             if sleep > 0:
                 time.sleep(sleep)
+
+    # Defense-in-depth: the keyframe count is a load-bearing wire contract
+    # (server grounding expects exactly this many for the active horizon).
+    # Catch any drift — misconfigured CAPTURE_EVERY, a non-divisible S, etc.
+    expected_kf = (n_frames - start_frame) * (n_sub // CAPTURE_EVERY)
+    if len(keyframes) != expected_kf:
+        raise RuntimeError(
+            f"keyframe count {len(keyframes)} != expected {expected_kf} "
+            f"(F={n_frames} S={n_sub} start_frame={start_frame} "
+            f"CAPTURE_EVERY={CAPTURE_EVERY}) — would desync server grounding")
 
     stats = {
         "n_substeps": n_substeps,
@@ -244,7 +266,8 @@ def _wait_for_operator(args) -> None:
 
 def _connect_policy(args) -> PolicyClient:
     log.info(f"Connecting to policy server ws://{args.server_host}:{args.server_port}")
-    policy = PolicyClient(host=args.server_host, port=args.server_port)
+    policy = PolicyClient(host=args.server_host, port=args.server_port,
+                          recv_timeout=args.server_timeout)
     log.info(f"Server metadata: {policy.get_server_metadata()}")
     return policy
 
@@ -263,93 +286,311 @@ def _async_step_worker(policy, prev_kf, prev_act, cur, out_q):
     """Branch B: the single blocking async_step request, run on a daemon
     thread so it overlaps Branch A (execute_chunk on the main thread).
 
-    Sends the PREVIOUS chunk's keyframes + the just-executed action to be
-    grounded, plus the chunk executing right now (for the server's FDM
-    "imagine the executing chunk" pass). state/executing_action are passed
-    through verbatim — the server runs its own preprocess_action.
+    Sends the chunk executing right now (server's FDM "imagine the executing
+    chunk" pass) and, from cycle 1 on, the PREVIOUS chunk's keyframes +
+    just-executed action to ground. On cycle 0 there is no real feedback yet
+    (prev_kf is None) — the server skips grounding for the cold-start chunk
+    (author-confirmed); obs/state are omitted entirely. state/executing_action
+    are passed through verbatim — the server runs its own preprocess_action.
     """
     try:
-        resp = policy.infer({
+        payload = {
             "async_step": True,
-            "obs": prev_kf,           # K_{n-1}
-            "state": prev_act,        # a_{n-1}, verbatim
-            "executing_action": cur,  # C_n,    verbatim
-        })
+            "executing_action": cur,  # C_n, verbatim
+        }
+        if prev_kf is not None:       # cycle >=1: ground C_{n-1}
+            payload["obs"] = prev_kf      # K_{n-1}
+            payload["state"] = prev_act   # a_{n-1}, verbatim
+        resp = policy.infer(payload)
         out_q.put(("ok", resp))
     except BaseException as e:  # surface daemon failure to the main thread
         out_q.put(("err", e))
 
 
-def _run_inference_loop(arm, grip, cam, policy, args) -> None:
-    """Asynchronous, FDM-grounded loop (Algorithm 2, two-chunk buffered).
+class ResetRequested(Exception):
+    """Operator pressed 'r' during a running task (single keystroke, cbreak
+    mode — no Enter). The current task aborts at the next chunk boundary;
+    _run_inference_loop catches this, runs _initialize_pose, waits for the
+    standby Enter, and starts a fresh task — which re-issues policy.reset
+    (server clears its KV cache via _reset → create_empty_cache). Same
+    effect as Ctrl+C → restart, but one key and the loop stays alive."""
 
-    reset → cold_start (TWO chunks: C0 to run now, C1 buffered) → execute
-    C0 (the one non-overlapped chunk) → steady loop where each cycle
-    overlaps the async_step request (daemon thread) with execute_chunk
-    (main thread). The buffered C1 keeps the steady loop one chunk ahead so
-    it stays overlapped instead of stalling. compute_kv_cache is NOT used
-    in this path — grounding folds into async_step.
+
+def _reset_stdin_watcher(reset_event, stop_event, fd):
+    """Daemon thread body: single-key reset. Terminal is in cbreak mode
+    (set by _make_reset_watcher), so 'r'/'R' is delivered byte-by-byte
+    without waiting for Enter. select() with a short timeout lets
+    stop_event stop us promptly before any input() call elsewhere."""
+    try:
+        while not stop_event.is_set():
+            rlist, _, _ = select.select([fd], [], [], 0.1)
+            if not rlist:
+                continue
+            try:
+                ch = os.read(fd, 1)
+            except (BlockingIOError, OSError):
+                continue
+            if not ch:                # EOF — disable reset for this task
+                return
+            if ch in (b"r", b"R"):
+                log.info("Reset key pressed — task will abort at next chunk "
+                         "boundary (server KV cache will be cleared on re-run)")
+                reset_event.set()
+                return
+            # any other keystroke is ignored
+    except Exception:
+        log.exception("Reset watcher crashed; reset key disabled this task")
+
+
+def _make_reset_watcher(args):
+    """Factory: returns (reset_event, stop_event, watcher_thread, restore_fn).
+
+    Puts stdin in cbreak (single-keystroke) mode so pressing 'r' alone is
+    detected immediately — no Enter required. cbreak keeps the ISIG flag
+    so Ctrl+C still raises KeyboardInterrupt. restore_fn returns stdin to
+    canonical mode and MUST be called before any input() in the loop
+    (otherwise input() echoes nothing and line-editing is broken).
+
+    Falls back to disabled (no terminal change, no watcher) if --repeat is
+    off, stdin is not a TTY, or termios fails — never raises.
+    """
+    reset_event = threading.Event()
+    stop_event = threading.Event()
+    watcher = None
+    restore = None
+    # Reset key is always meaningful — pressing 'r' is itself an explicit
+    # re-run request, so we don't require --repeat. (Without --repeat, the
+    # reset triggers exactly one re-run; with --repeat, the loop continues
+    # naturally after the re-run as it would post any task.)
+    try:
+        fd = sys.stdin.fileno()
+    except (ValueError, OSError):
+        log.info("stdin has no fileno — reset key disabled this task")
+        return reset_event, stop_event, watcher, restore
+    if not os.isatty(fd):
+        log.info("stdin is not a TTY — reset key disabled this task")
+        return reset_event, stop_event, watcher, restore
+    try:
+        saved = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+    except termios.error as e:
+        log.info(f"Cannot set cbreak mode ({e}) — reset key disabled this task")
+        return reset_event, stop_event, watcher, restore
+
+    def restore_fn():
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+            # Drain anything the user typed in cbreak that the watcher
+            # didn't consume (e.g. a habitual '\n' typed after 'r'). Without
+            # this the next input() sees a pending '\n' and returns
+            # immediately, auto-pressing the standby Enter.
+            termios.tcflush(fd, termios.TCIFLUSH)
+        except Exception:
+            log.exception("Failed to restore terminal mode")
+    restore = restore_fn
+
+    watcher = threading.Thread(
+        target=_reset_stdin_watcher,
+        args=(reset_event, stop_event, fd),
+        daemon=True, name="reset-watcher")
+    watcher.start()
+    return reset_event, stop_event, watcher, restore
+
+
+def _run_task_once(arm, grip, cam, policy, args, reset_event=None) -> None:
+    """One full task: reset → cold_start (ONE chunk C0) → steady async loop.
+
+    Every cycle (incl. cycle 0) overlaps the async_step request (daemon
+    thread) with execute_chunk (main thread). Cycle 0 sends no prev feedback
+    — the server skips grounding for the cold-start chunk and
+    FDM-imagines+PREDICTs C1 while the robot executes C0. compute_kv_cache is
+    NOT used — grounding folds into async_step (cycle n≥1). Returns when
+    max_chunks cycles have completed.
     """
     log.info(f"Reset with prompt: {args.prompt!r}")
     policy.reset(args.prompt)
 
-    # Cold start: ONE init frame in, TWO chunks back. C0 runs now; C1 is
-    # buffered so the first async_step can ground C0's real feedback while
-    # the robot executes C1 (the pipeline buffer that keeps the overlapped
-    # loop from stalling). C1 is FDM-grounded on z_0 server-side (chunk
-    # 1), not an ungrounded rollout — so the opening stays accurate.
-    log.info("Cold start: sending one init frame, expecting two chunks")
+    # Cold start: ONE init frame in, ONE chunk back. The server grounds
+    # nothing for C0; it FDM-imagines C0 (z_0 pinned) and PREDICTs C1 on the
+    # FIRST async_step, overlapped with executing C0 below — so no chunk is
+    # predicted on an ungrounded hallucination and none is executed serially.
+    log.info("Cold start: sending one init frame, expecting one chunk")
     init = cam.get_obs(args.prompt)
     resp = policy.infer({"cold_start": True, "obs": init})
-    C0, C1 = resp["action"], resp["action1"]
-    log.info(f"Cold start returned C0 {C0.shape}, C1 {C1.shape}")
+    C0 = resp["action"]
+    log.info(f"Cold start returned C0 {C0.shape}")
     log_chunk_summary(0, C0)
 
-    # The ONE non-overlapped chunk. C0 ran is_first_chunk=True → frame 0
-    # skipped → 4 keyframes. Nothing to overlap it against yet.
-    exec_tic = time.time()
-    K0, st = execute_chunk(C0, arm, grip, cam, is_first_chunk=True,
-                           substep_dt=1.0 / args.substep_hz,
-                           verbose_substeps=not args.quiet_substeps)
-    log.info(f"[cycle 0] C0 execute={time.time()-exec_tic:6.3f}s "
-             f"keyframes={len(K0)} (expect 4)")
-
-    prev_kf, prev_act = K0, C0
-    cur = C1  # the chunk to execute next
-
-    for n in range(1, args.max_chunks + 1):
-        out_q = queue.Queue()
-        th = threading.Thread(
-            target=_async_step_worker,
-            args=(policy, prev_kf, prev_act, cur, out_q),
-            daemon=True, name=f"async_step-{n}")
-        th.start()  # Branch B fires; do NOT block main on it
+    # Uniform overlapped loop from cycle 0. Cycle 0 sends no prev feedback
+    # (server skips grounding for C0) and runs C0 is_first_chunk=True (frame
+    # 0 skipped → 4 keyframes); cycle n≥1 grounds C_{n-1} → 8 keyframes.
+    prev_kf, prev_act = None, None  # no real feedback before cycle 0
+    cur = C0
+    sync_mode = getattr(args, "sync", False)
+    for n in range(args.max_chunks):
+        if not sync_mode:
+            # Async: spawn worker BEFORE execute so the request overlaps it
+            out_q = queue.Queue()
+            th = threading.Thread(
+                target=_async_step_worker,
+                args=(policy, prev_kf, prev_act, cur, out_q),
+                daemon=True, name=f"async_step-{n}")
+            th.start()  # Branch B fires; do NOT block main on it
 
         # Branch A: execute the current chunk at 30 Hz on the main thread.
-        # Steady chunks run is_first_chunk=False → 8 keyframes.
+        # Cycle 0 is the first chunk → skip frame-0 ('observe start').
         exec_tic = time.time()
-        Kn, st = execute_chunk(cur, arm, grip, cam, is_first_chunk=False,
+        Kn, st = execute_chunk(cur, arm, grip, cam, is_first_chunk=(n == 0),
                                substep_dt=1.0 / args.substep_hz,
                                verbose_substeps=not args.quiet_substeps)
         exec_s = time.time() - exec_tic
 
-        status, payload = out_q.get()  # join: block until the request returns
-        th.join()
-        if status == "err":
-            raise payload
-        next_chunk = payload["action"]
+        if sync_mode:
+            # Sync: do the request inline on the main thread, AFTER execute.
+            # Wire payload is identical to async — only the threading and
+            # the wall-clock relationship to execute_chunk differ. The
+            # PolicyClient recv_timeout (built from args.server_timeout)
+            # still bounds the wait, so a stalled server raises TimeoutError
+            # the same way and routes to run()'s finally.
+            payload = {"async_step": True, "executing_action": cur}
+            if prev_kf is not None:
+                payload["obs"] = prev_kf
+                payload["state"] = prev_act
+            resp = policy.infer(payload)
+            next_chunk = resp["action"]
+        else:
+            # Async: collect from worker, bounded so we never freeze. The
+            # PolicyClient recv timeout fires inside the worker; this
+            # out_q.get timeout is the defense-in-depth backstop in case
+            # the worker hangs somewhere other than recv.
+            to = getattr(args, "server_timeout", 60.0)
+            try:
+                status, payload = out_q.get(timeout=to)
+            except queue.Empty:
+                raise TimeoutError(
+                    f"async_step did not return within {to:.0f}s — "
+                    f"server/tunnel stalled; aborting so arm_sdk is "
+                    f"released (robot not latched)")
+            th.join()
+            if status == "err":
+                raise payload
+            next_chunk = payload["action"]
 
         log.info(
-            f"[cycle {n}] execute={exec_s:6.3f}s "
+            f"[cycle {n}] {'SYNC ' if sync_mode else ''}execute={exec_s:6.3f}s "
             f"(motion ~{st['n_substeps']/args.substep_hz:.2f}s, "
             f"overruns={st['n_overrun']}/{st['n_substeps']}, "
             f"keyframes={len(Kn)})  "
             + _fmt_infer_timing("async_step", policy.last_timing))
-        log_chunk_summary(n, next_chunk)
+        log_chunk_summary(n + 1, next_chunk)
 
         # Rotate: this cycle's keyframes/action become next cycle's "previous"
         # to ground; next_chunk becomes what we execute next.
         prev_kf, prev_act, cur = Kn, cur, next_chunk
+
+        # Reset key polled at chunk boundary (~1-2 s worst-case latency,
+        # well under one chunk). Don't break mid-chunk — the 30 Hz dispatch
+        # has to finish cleanly before we hand control back to init.
+        if reset_event is not None and reset_event.is_set():
+            log.info(f"[cycle {n}] reset acknowledged — aborting task; "
+                     f"will run INIT then wait for Enter to start fresh task")
+            raise ResetRequested()
+
+
+def _wait_for_rerun(args) -> bool:
+    """Between-tasks gate. Returns True to proceed to INIT mode (arm to
+    ready + gripper cycle), False to exit. After init, _wait_for_operator
+    is the second Enter that starts MAIN mode — same gate as first-run
+    startup. Auto-pressed by --auto-start (= unattended loop forever).
+    """
+    if getattr(args, "auto_start", False):
+        log.info("--auto-start: skipping re-run prompt; proceeding to init")
+        return True
+    log.info("===============================================================")
+    log.info("TASK COMPLETE.")
+    log.info("Press [Enter] to enter INITIALIZATION mode (arm/gripper reset).")
+    log.info("After init you'll be prompted again to start the next task.")
+    log.info("Press [Ctrl+C] to quit safely.")
+    log.info("===============================================================")
+    try:
+        input("")
+    except EOFError:
+        log.info("EOF on stdin — exiting repeat mode")
+        return False
+    return True
+
+
+def _run_inference_loop(arm, grip, cam, policy, args) -> None:
+    """Run the task once; with --repeat, prompt Enter between tasks to clear
+    the server's KV cache (via reset → cold_start) and run it again.
+
+    Between tasks: switch arm kp back to the stiff hold value captured at
+    startup (less gravity sag while the operator stages), move the arm and
+    grippers back to ready, then block on Enter (same gate as the initial
+    standby). On Enter: switch kp back to the inference value and run again.
+    """
+    while True:
+        # Start the single-key 'r' watcher only for this task's duration.
+        # Terminal is put in cbreak mode while the task runs and restored
+        # before any Enter prompt below — no stdin race, line-editing
+        # works again for input().
+        reset_event, stop_event, watcher, restore = _make_reset_watcher(args)
+        if watcher is not None:
+            log.info("Press 'r' at any time to reset to INIT mode "
+                     "(no Enter needed; server KV cache cleared on next task).")
+        task_was_reset = False
+        try:
+            try:
+                _run_task_once(arm, grip, cam, policy, args,
+                               reset_event=reset_event)
+            except ResetRequested:
+                task_was_reset = True
+        finally:
+            stop_event.set()
+            if watcher is not None:
+                watcher.join(timeout=1.0)
+            # MUST restore canonical mode before any input() — otherwise
+            # the Enter prompts below won't echo / line-edit properly.
+            if restore is not None:
+                restore()
+
+        # Exit only when the task ended naturally AND --repeat is off.
+        # A reset ALWAYS triggers one full INIT → standby → re-run cycle,
+        # even without --repeat (pressing 'r' is itself the re-run signal).
+        if not task_was_reset and not getattr(args, "repeat", False):
+            return
+
+        # ----- Enter #1: operator confirms ready for INIT -----
+        # First-run startup runs init automatically. Between tasks the arm
+        # is in an arbitrary post-task pose, so we ask before moving it.
+        # The reset path SKIPS this prompt — pressing 'r' already implied
+        # "I want to reset", no need to ask again.
+        if not task_was_reset:
+            if not _wait_for_rerun(args):
+                return
+        else:
+            log.info("Reset acknowledged — proceeding to INIT (skipping "
+                     "the 'Press Enter to init' gate)")
+
+        # ----- INIT mode (mirrors _initialize_pose at startup) -----
+        # Stiffer hold for the standby wait (less gravity sag). _init_kp_arm
+        # is captured in run() before the first set_arm_kp(inference_kp_arm)
+        # so we restore exactly what the arm was using at startup — no
+        # hardcoded duplicate.
+        init_kp = getattr(args, "_init_kp_arm", None)
+        if init_kp is not None:
+            log.info(f"Switching arm kp back to standby value: {init_kp}")
+            arm.set_arm_kp(init_kp)
+        _initialize_pose(arm, grip, args)
+
+        # ----- Enter #2: standby (same call as first-run startup) -----
+        _wait_for_operator(args)
+
+        # ----- MAIN mode -----
+        log.info(f"Switching arm kp back to inference value: {args.inference_kp_arm}")
+        arm.set_arm_kp(args.inference_kp_arm)
+        # loop: _run_task_once again — sends a fresh reset (clears server
+        # KV cache) and cold_start, exactly like a clean start.
 
 
 def _cleanup(arm, grip, cam, policy) -> None:
@@ -410,6 +651,9 @@ def run(args):
         cam = _setup_camera(args)
         _initialize_pose(arm, grip, args)
         _wait_for_operator(args)
+        # Capture the stiff-hold kp before we drop to inference, so --repeat
+        # can restore it between tasks without duplicating the constant.
+        args._init_kp_arm = arm.kp_arm
         log.info(f"Switching arm kp to inference value: {args.inference_kp_arm}")
         arm.set_arm_kp(args.inference_kp_arm)
         policy = _connect_policy(args)
@@ -430,6 +674,20 @@ def main():
                    help="How many action chunks to execute before stopping")
     p.add_argument("--video-guidance", type=float, default=5.0)
     p.add_argument("--action-guidance", type=float, default=1.0)
+    p.add_argument("--server-timeout", type=float, default=60.0,
+                   help="Max seconds to wait for one server reply (cold_start/"
+                        "async_step). On a stall the client aborts and releases "
+                        "arm_sdk instead of hanging forever with the robot "
+                        "latched. Must exceed worst-case server compute "
+                        "(~2-3s); default 60.")
+    p.add_argument("--sync", action="store_true",
+                   help="Run async_step requests synchronously on the main "
+                        "thread, AFTER execute_chunk completes — no daemon "
+                        "thread, no overlap. Wire contract unchanged. "
+                        "Per-chunk wall becomes (execute + request) instead "
+                        "of max(execute, request). Useful for debugging / "
+                        "latency attribution; significantly slower steady-"
+                        "state. Default is async (overlapped).")
 
     # ---- Safety / motion limits ----
     p.add_argument("--velocity-limit", type=float, default=8.0,
@@ -455,6 +713,12 @@ def main():
                         "to slow down the whole chunk if motion still looks too fast.")
     p.add_argument("--quiet-substeps", action="store_true",
                    help="Suppress per-substep target printing (only chunk summaries).")
+    p.add_argument("--repeat", action="store_true",
+                   help="After each task completes, return arm to ready pose "
+                        "and wait for [Enter] to clear the server KV cache "
+                        "and run the task again. Without this flag, exit "
+                        "after one task. --auto-start with --repeat = loop "
+                        "forever unattended.")
     p.add_argument("--auto-start", action="store_true",
                    help="Skip the post-init Enter prompt and start inference immediately.")
     args = p.parse_args()
