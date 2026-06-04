@@ -61,7 +61,7 @@ from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 from g1_client.arm_controller import ArmController, INIT_POSE_READY
 from g1_client.gripper_controller import GripperController, GRIPPER_MIN, GRIPPER_MAX
 from g1_client.camera_client import CameraClient
-from g1_client.openpi_policy import OpenPIPolicy
+from g1_client.policy_client import PolicyClient
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -125,10 +125,17 @@ def log_chunk_ranges(chunk_id: int, actions: np.ndarray) -> None:
 
 # ---------- inference loop (the "send" side) ----------
 
-def _infer_worker(policy: OpenPIPolicy, obs: dict, box: dict) -> None:
-    """Run one blocking infer on a daemon thread; stash result/exception."""
+def _infer_worker(policy: PolicyClient, obs: dict, box: dict) -> None:
+    """Run one blocking infer on a daemon thread; stash result/exception.
+
+    Extracts and validates the action array (same as the first-chunk path) so
+    the loop receives a [H, 16] ndarray, not the raw {"actions": ...} dict.
+    """
     try:
-        box["actions"] = policy.infer(obs)
+        actions = np.asarray(policy.infer(obs)["actions"], dtype=np.float64)
+        if actions.ndim != 2 or actions.shape[1] < 16:
+            raise RuntimeError(f"Unexpected action shape {actions.shape} (want [H, 16])")
+        box["actions"] = actions
     except BaseException as e:  # surface to the main thread
         box["err"] = e
 
@@ -148,7 +155,8 @@ def _run_inference_loop(arm, grip, cam, policy, args) -> None:
 
     # First chunk is a blocking infer (nothing to overlap it against yet).
     log.info(f"First inference (prompt={prompt!r})")
-    actions = policy.infer(build_obs(cam, arm, grip, prompt))
+    result = policy.infer(build_obs(cam, arm, grip, prompt))
+    actions = np.asarray(result["actions"],dtype=np.float64)
     if actions.ndim != 2 or actions.shape[1] < 16:
         raise RuntimeError(f"Unexpected action shape {actions.shape} (want [H, 16])")
     log_chunk_ranges(0, actions)
@@ -190,8 +198,6 @@ def _run_inference_loop(arm, grip, cam, policy, args) -> None:
         if "err" in box:
             raise box["err"]
         next_actions = box["actions"]
-        log.info(f"[chunk {c}] exec={time.time()-exec_tic:6.3f}s "
-                 f"(steps={n}, motion~{n*dt:.2f}s) -> next {next_actions.shape}")
         log_chunk_ranges(c, next_actions)
         actions = next_actions
 
@@ -275,7 +281,7 @@ def run(args) -> None:
         _wait_for_operator(args)
         log.info(f"Switching arm kp to inference value: {args.inference_kp_arm}")
         arm.set_arm_kp(args.inference_kp_arm)
-        policy = OpenPIPolicy(host=args.server_host, port=args.server_port)
+        policy = PolicyClient(host=args.server_host, port=args.server_port)
         _run_inference_loop(arm, grip, cam, policy, args)
     finally:
         _cleanup(arm, grip, cam, policy)
@@ -288,7 +294,7 @@ def main() -> None:
     p.add_argument("--server-port", type=int, default=8000, help="openpi server port (default 8000)")
     p.add_argument("--image-server", default="192.168.123.164",
                    help="G1 PC2 image-server host (default 192.168.123.164)")
-    p.add_argument("--prompt", default="pick up the pink object and place it on the blue cross mark")
+    p.add_argument("--prompt", default="pick the red bottle")
     p.add_argument("--max-chunks", type=int, default=20,
                    help="How many action chunks to run before stopping")
     p.add_argument("--control-hz", type=float, default=30.0,
