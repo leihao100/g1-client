@@ -141,7 +141,7 @@ def _infer_worker(policy: PolicyClient, obs: dict, box: dict) -> None:
 
 
 def _run_inference_loop(arm, grip, cam, policy, args) -> None:
-    """Receding-horizon loop with one-chunk prefetch.
+    """Receding-horizon loop with one-chunk prefetch + boundary smoothing.
 
     Execute the current chunk at args.control_hz on the main thread; when
     prefetch_lead steps remain, snapshot a fresh obs and fire the next infer on
@@ -149,6 +149,15 @@ def _run_inference_loop(arm, grip, cam, policy, args) -> None:
     This mirrors the UR3 PrefetchBroker's "fetch while N steps remain" idea so
     chunk boundaries don't stall the dispatch (the arm/gripper publish threads
     keep holding the last target meanwhile, so even a stall is safe, just jerky).
+
+    Two anti-jitter measures at the chunk boundary (where the model re-plans):
+      * Time-alignment (--chunk-align, on by default): a chunk is predicted from
+        an obs taken a few steps BEFORE we adopt it, so its leading steps are
+        already "in the past". We skip exactly those, otherwise the arm jumps
+        back to a stale pose then forward again — the back-and-forth shake.
+      * Cross-fade (--blend-steps): the first N steps of a new chunk ramp in
+        linearly from the last commanded pose, so any residual mismatch between
+        the old and new prediction eases in instead of snapping.
     """
     dt = 1.0 / args.control_hz
     prompt = args.prompt
@@ -161,28 +170,49 @@ def _run_inference_loop(arm, grip, cam, policy, args) -> None:
         raise RuntimeError(f"Unexpected action shape {actions.shape} (want [H, 16])")
     log_chunk_ranges(0, actions)
 
+    # Boundary-smoothing state, persisted across chunks:
+    #   start_idx — where to begin in the freshly received chunk (time-alignment)
+    #   last_cmd  — last 16-vec actually commanded, for the cross-fade ramp-in
+    start_idx = 0
+    last_cmd = None
     for c in range(1, args.max_chunks + 1):
-        n = actions.shape[0] if args.exec_steps <= 0 else min(args.exec_steps, actions.shape[0])
-        prefetch_lead = min(args.prefetch_lead, n)
+        H = actions.shape[0]
+        end_idx = H if args.exec_steps <= 0 else min(start_idx + args.exec_steps, H)
+        n = end_idx - start_idx
+        if n <= 0:
+            raise RuntimeError(
+                f"chunk {c}: nothing left to execute (start_idx={start_idx}, "
+                f"horizon={H}) — --prefetch-lead too large for this horizon")
+        lead = min(args.prefetch_lead, n)
         box: dict = {}
         th = None
+        pending_skip = 0
 
-        exec_tic = time.time()
-        for t in range(n):
+        for i in range(n):
             if arm.faulted():
                 raise RuntimeError("ArmController control thread faulted — aborting")
             tic = time.time()
 
-            a = actions[t]
-            arm.set_arm_target(a[ARM_CHANNELS].astype(np.float64))
+            a = actions[start_idx + i].astype(np.float64)
+            # Cross-fade the first --blend-steps from the last commanded pose
+            # into the new chunk so a swap ramps in instead of snapping.
+            if last_cmd is not None and i < args.blend_steps:
+                alpha = (i + 1) / (args.blend_steps + 1)
+                a = (1.0 - alpha) * last_cmd + alpha * a
+            arm.set_arm_target(a[ARM_CHANNELS])
             grip.set_targets(
                 float(np.clip(a[LEFT_GRIPPER_CHANNEL], GRIPPER_MIN, GRIPPER_MAX)),
                 float(np.clip(a[RIGHT_GRIPPER_CHANNEL], GRIPPER_MIN, GRIPPER_MAX)),
             )
+            last_cmd = a
 
-            # Fire the next-chunk request once prefetch_lead steps remain.
-            if th is None and (n - t) <= prefetch_lead:
+            # Fire the next-chunk request once `lead` steps remain. The steps
+            # still to run after this obs snapshot (n-1-i) are how stale the next
+            # chunk will be when we adopt it, so we skip that many of its leading
+            # steps to stay time-aligned (disable with --no-chunk-align).
+            if th is None and (n - i) <= lead:
                 obs_next = build_obs(cam, arm, grip, prompt)
+                pending_skip = (n - 1 - i) if args.chunk_align else 0
                 th = threading.Thread(target=_infer_worker,
                                       args=(policy, obs_next, box),
                                       daemon=True, name=f"prefetch-{c}")
@@ -200,6 +230,7 @@ def _run_inference_loop(arm, grip, cam, policy, args) -> None:
         next_actions = box["actions"]
         log_chunk_ranges(c, next_actions)
         actions = next_actions
+        start_idx = min(pending_skip, next_actions.shape[0] - 1)
 
 
 # ---------- pipeline stages (kept identical in spirit to main.py) ----------
@@ -283,6 +314,7 @@ def run(args) -> None:
         arm.set_arm_kp(args.inference_kp_arm)
         policy = PolicyClient(host=args.server_host, port=args.server_port)
         _run_inference_loop(arm, grip, cam, policy, args)
+        _initialize_pose(arm, grip, args)
     finally:
         _cleanup(arm, grip, cam, policy)
 
@@ -295,16 +327,26 @@ def main() -> None:
     p.add_argument("--image-server", default="192.168.123.164",
                    help="G1 PC2 image-server host (default 192.168.123.164)")
     p.add_argument("--prompt", default="pick the red bottle")
-    p.add_argument("--max-chunks", type=int, default=20,
+    p.add_argument("--max-chunks", type=int, default=30,
                    help="How many action chunks to run before stopping")
-    p.add_argument("--control-hz", type=float, default=30.0,
+    p.add_argument("--control-hz", type=float, default=15.0,
                    help="Per-step dispatch rate; match your LeRobot recording fps (default 30)")
     p.add_argument("--exec-steps", type=int, default=0,
                    help="Steps to execute per chunk before re-querying; 0 = full horizon. "
                         "Set smaller (e.g. 25) for tighter closed-loop reactivity.")
-    p.add_argument("--prefetch-lead", type=int, default=8,
+    p.add_argument("--prefetch-lead", type=int, default=5,
                    help="Start the next inference when this many steps remain in the "
                         "current chunk, so it overlaps and the boundary doesn't stall (default 8)")
+    p.add_argument("--blend-steps", type=int, default=5,
+                   help="Cross-fade the first N steps of each new chunk from the last "
+                        "commanded pose so a chunk swap ramps in smoothly instead of "
+                        "snapping (default 5; 0 disables blending)")
+    p.add_argument("--no-chunk-align", action="store_false", dest="chunk_align",
+                   help="Disable chunk time-alignment. By default the leading steps of "
+                        "a freshly received chunk that already elapsed during inference "
+                        "are skipped so the trajectory stays wall-clock aligned (this is "
+                        "what removes the boundary back-and-forth). Pass this to execute "
+                        "every chunk from index 0 for A/B comparison.")
     # ---- Safety / motion limits (same as main.py) ----
     p.add_argument("--velocity-limit", type=float, default=8.0,
                    help="rad/s velocity cap on the per-tick motion clamp (default 8.0)")
