@@ -125,14 +125,108 @@ def log_chunk_ranges(chunk_id: int, actions: np.ndarray) -> None:
 
 # ---------- inference loop (the "send" side) ----------
 
+def _pct(xs, p):
+    return float(np.percentile(xs, p)) if xs else float("nan")
+
+
+def _stat(xs):
+    """(min, p50, p95, max, mean) of a list of numbers."""
+    return (min(xs), _pct(xs, 50), _pct(xs, 95), max(xs), float(np.mean(xs)))
+
+
+def _extract_server_ms(result):
+    """Server-reported inference time (ms) if present, else None — lets us split
+    wait_recv into network vs on-GPU compute."""
+    if not isinstance(result, dict):
+        return None
+    for k in ("server_timing", "policy_timing", "timing"):
+        v = result.get(k)
+        if isinstance(v, dict):
+            for tk, scale in (("infer_ms", 1.0), ("inference_ms", 1.0),
+                              ("infer_time_ms", 1.0), ("infer_s", 1e3),
+                              ("inference_s", 1e3)):
+                if tk in v:
+                    try:
+                        return float(v[tk]) * scale
+                    except (TypeError, ValueError):
+                        return None
+    return None
+
+
+def _timing_rec(tm, server_ms=None):
+    """Turn PolicyClient.last_timing into a uniform per-infer record (ms)."""
+    return {
+        "wall_ms": tm.get("total_s", 0.0) * 1e3,
+        "pack_ms": tm.get("pack_s", 0.0) * 1e3,
+        "send_ms": tm.get("send_s", 0.0) * 1e3,
+        "wait_recv_ms": tm.get("wait_recv_s", 0.0) * 1e3,
+        "unpack_ms": tm.get("unpack_s", 0.0) * 1e3,
+        "server_ms": server_ms,
+        "bytes_sent": tm.get("bytes_sent", -1),
+        "bytes_recv": tm.get("bytes_recv", -1),
+    }
+
+
+def _summarize_timing(infer_recs, chunk_recs, args):
+    """Per-step latency breakdown + bottleneck + stall verdict (same stats as
+    test_policy_server, plus the execute-vs-stall signal only a real run gives)."""
+    if not infer_recs:
+        return
+    budget_ms = (args.prefetch_lead / args.control_hz) * 1e3
+    log.info("=" * 64)
+    comps = [("pack", "pack_ms"), ("send", "send_ms"),
+             ("wait_recv", "wait_recv_ms"), ("unpack", "unpack_ms"),
+             ("wall(total)", "wall_ms")]
+    log.info(f"per-infer latency over {len(infer_recs)} calls (ms):")
+    log.info(f"  {'component':<14} {'min':>7} {'p50':>7} {'p95':>7} {'max':>7} {'mean':>7}")
+    means = {}
+    for label, key in comps:
+        mn, p50, p95, mx, me = _stat([r[key] for r in infer_recs])
+        means[label] = me
+        log.info(f"  {label:<14} {mn:7.1f} {p50:7.1f} {p95:7.1f} {mx:7.1f} {me:7.1f}")
+    srv = [r["server_ms"] for r in infer_recs if r["server_ms"] is not None]
+    if srv:
+        mn, p50, p95, mx, me = _stat(srv)
+        log.info(f"  {'server_infer':<14} {mn:7.1f} {p50:7.1f} {p95:7.1f} {mx:7.1f} {me:7.1f}")
+        log.info(f"  => network (wait_recv - server_infer) ~= {means['wait_recv']-me:.1f} ms "
+                 f"mean (GPU compute ~= {me:.1f} ms)")
+    sub = {k: means[k] for k in ("pack", "send", "wait_recv", "unpack")}
+    bn = max(sub, key=sub.get)
+    log.info(f"BOTTLENECK (mean): {bn} = {sub[bn]:.1f} ms "
+             f"({sub[bn]/means['wall(total)']*100:.0f}% of infer total)")
+    if bn in ("pack", "send"):
+        up = [r["bytes_sent"] for r in infer_recs if r["bytes_sent"] > 0]
+        if up:
+            log.info(f"  upload payload ~= {np.mean(up)/1024:.0f} KiB/infer (decoded RGB "
+                     f"frames) — sending JPEG bytes would cut pack+send ~10-15x.")
+    if chunk_recs:
+        ex = [r["exec_s"] for r in chunk_recs]
+        jw = [r["join_wait_s"] * 1e3 for r in chunk_recs]
+        stalled = sum(1 for x in jw if x > 1.0)
+        log.info(f"execute/chunk: mean={np.mean(ex):.2f}s | join_wait: mean={np.mean(jw):.0f}ms "
+                 f"p95={_pct(jw,95):.0f}ms | stalled {stalled}/{len(jw)} chunks "
+                 f"(overlap budget {budget_ms:.0f}ms)")
+        if stalled:
+            log.warning(f"{stalled} chunk(s) STALLED at the boundary (infer didn't fit the "
+                        f"overlap window) — that's the 顿. Raise --prefetch-lead / lower "
+                        f"--control-hz, or fix the bottleneck above.")
+        else:
+            log.info("no chunk stalled — inference fully hidden behind execution.")
+    log.info("=" * 64)
+
+
 def _infer_worker(policy: PolicyClient, obs: dict, box: dict) -> None:
-    """Run one blocking infer on a daemon thread; stash result/exception.
+    """Run one blocking infer on a daemon thread; stash result/exception/timing.
 
     Extracts and validates the action array (same as the first-chunk path) so
-    the loop receives a [H, 16] ndarray, not the raw {"actions": ...} dict.
+    the loop receives a [H, 16] ndarray, not the raw {"actions": ...} dict, and
+    stashes the latency breakdown so the main thread can profile it post-join.
     """
     try:
-        actions = np.asarray(policy.infer(obs)["actions"], dtype=np.float64)
+        result = policy.infer(obs)
+        box["timing"] = dict(policy.last_timing or {})
+        box["server_ms"] = _extract_server_ms(result)
+        actions = np.asarray(result["actions"], dtype=np.float64)
         if actions.ndim != 2 or actions.shape[1] < 16:
             raise RuntimeError(f"Unexpected action shape {actions.shape} (want [H, 16])")
         box["actions"] = actions
@@ -170,6 +264,11 @@ def _run_inference_loop(arm, grip, cam, policy, args) -> None:
         raise RuntimeError(f"Unexpected action shape {actions.shape} (want [H, 16])")
     log_chunk_ranges(0, actions)
 
+    # Latency profiling: same per-step breakdown as test_policy_server, plus the
+    # execute-vs-stall signal only a real run can measure.
+    infer_recs = [_timing_rec(dict(policy.last_timing or {}), _extract_server_ms(result))]
+    chunk_recs = []
+
     # Boundary-smoothing state, persisted across chunks:
     #   start_idx — where to begin in the freshly received chunk (time-alignment)
     #   last_cmd  — last 16-vec actually commanded, for the cross-fade ramp-in
@@ -188,6 +287,7 @@ def _run_inference_loop(arm, grip, cam, policy, args) -> None:
         th = None
         pending_skip = 0
 
+        exec_t0 = time.time()
         for i in range(n):
             if arm.faulted():
                 raise RuntimeError("ArmController control thread faulted — aborting")
@@ -223,14 +323,28 @@ def _run_inference_loop(arm, grip, cam, policy, args) -> None:
                 time.sleep(sleep)
 
         # Collect the prefetched next chunk (it should be done or nearly).
+        exec_s = time.time() - exec_t0
+        join_t0 = time.time()
         if th is not None:
             th.join()
+        join_wait_s = time.time() - join_t0
         if "err" in box:
             raise box["err"]
         next_actions = box["actions"]
+
+        rec = _timing_rec(box.get("timing", {}), box.get("server_ms"))
+        infer_recs.append(rec)
+        chunk_recs.append({"exec_s": exec_s, "join_wait_s": join_wait_s})
+        log.info(f"[chunk {c}] execute={exec_s:.2f}s join_wait={join_wait_s*1e3:.0f}ms | "
+                 f"infer wall={rec['wall_ms']:.0f}ms pack={rec['pack_ms']:.0f} "
+                 f"send={rec['send_ms']:.0f} wait_recv={rec['wait_recv_ms']:.0f} "
+                 f"unpack={rec['unpack_ms']:.0f}"
+                 + (f" server={rec['server_ms']:.0f}" if rec['server_ms'] is not None else ""))
         log_chunk_ranges(c, next_actions)
         actions = next_actions
         start_idx = min(pending_skip, next_actions.shape[0] - 1)
+
+    _summarize_timing(infer_recs, chunk_recs, args)
 
 
 # ---------- pipeline stages (kept identical in spirit to main.py) ----------
