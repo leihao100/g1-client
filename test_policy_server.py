@@ -439,6 +439,10 @@ def main():
     p.add_argument("--server-host", required=True)
     p.add_argument("--server-port", type=int, default=8000)
     p.add_argument("--prompt", default="pick up the pink object and place it on the blue cross mark")
+    p.add_argument("--send-jpeg", action="store_true",
+                   help="Send compressed JPEG bytes instead of decoded RGB arrays "
+                        "(~12x smaller upload). Use to measure the network win; the "
+                        "server must imdecode + BGR->RGB these image keys.")
     # ---- self-generated obs content ----
     p.add_argument("--image-mode", choices=["zero", "random"], default="zero",
                    help="Synthetic image content")

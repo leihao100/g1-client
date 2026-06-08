@@ -96,16 +96,30 @@ def _jpeg_to_rgb(jpeg_bytes: bytes) -> np.ndarray:
 
 
 def build_obs(cam: CameraClient, arm: ArmController, grip: GripperController,
-              prompt: str) -> dict:
-    """Assemble one openpi observation from the (unchanged) controllers."""
-    imgs = cam.get_obs_images()  # dict of JPEG bytes, keys already LeRobot-style
+              prompt: str, send_jpeg: bool = False) -> dict:
+    """Assemble one openpi observation from the (unchanged) controllers.
+
+    send_jpeg=False (default): images are decoded RGB uint8 arrays — the legacy
+    wire format. ~720 KiB/obs of upload, which is the dominant network cost.
+
+    send_jpeg=True: ship the camera's compressed JPEG bytes straight through
+    (~60 KiB/obs, ~12x smaller upload). The SERVER must then decode AND swap
+    channels, exactly what _jpeg_to_rgb does here:
+        rgb = cv2.cvtColor(cv2.imdecode(buf, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
+    Get this wrong server-side and it's the silent channel-swap / garbage class
+    — keep client encode and server decode in lockstep.
+    """
+    imgs = cam.get_obs_images()  # dict of JPEG bytes (BGR, q90), LeRobot keys
     left_q, right_q = grip.get_state()
     arm_q = arm.get_arm_q()  # (14,)
     state = np.concatenate([arm_q, [left_q, right_q]]).astype(np.float32)  # (16,)
+
+    def _img(key):
+        return imgs[key] if send_jpeg else _jpeg_to_rgb(imgs[key])
     return {
-        "observation.images.cam_left_high": _jpeg_to_rgb(imgs["observation.images.cam_left_high"]),
-        "observation.images.cam_left_wrist": _jpeg_to_rgb(imgs["observation.images.cam_left_wrist"]),
-        "observation.images.cam_right_wrist": _jpeg_to_rgb(imgs["observation.images.cam_right_wrist"]),
+        "observation.images.cam_left_high": _img("observation.images.cam_left_high"),
+        "observation.images.cam_left_wrist": _img("observation.images.cam_left_wrist"),
+        "observation.images.cam_right_wrist": _img("observation.images.cam_right_wrist"),
         "observation.state": state,
         "prompt": prompt,
     }
@@ -255,10 +269,13 @@ def _run_inference_loop(arm, grip, cam, policy, args) -> None:
     """
     dt = 1.0 / args.control_hz
     prompt = args.prompt
+    if args.send_jpeg:
+        log.warning("--send-jpeg ON: sending compressed JPEG bytes. The SERVER must "
+                    "imdecode + cv2.COLOR_BGR2RGB these keys, or it sees garbage.")
 
     # First chunk is a blocking infer (nothing to overlap it against yet).
     log.info(f"First inference (prompt={prompt!r})")
-    result = policy.infer(build_obs(cam, arm, grip, prompt))
+    result = policy.infer(build_obs(cam, arm, grip, prompt, args.send_jpeg))
     actions = np.asarray(result["actions"],dtype=np.float64)
     if actions.ndim != 2 or actions.shape[1] < 16:
         raise RuntimeError(f"Unexpected action shape {actions.shape} (want [H, 16])")
@@ -311,7 +328,7 @@ def _run_inference_loop(arm, grip, cam, policy, args) -> None:
             # chunk will be when we adopt it, so we skip that many of its leading
             # steps to stay time-aligned (disable with --no-chunk-align).
             if th is None and (n - i) <= lead:
-                obs_next = build_obs(cam, arm, grip, prompt)
+                obs_next = build_obs(cam, arm, grip, prompt, args.send_jpeg)
                 pending_skip = (n - 1 - i) if args.chunk_align else 0
                 th = threading.Thread(target=_infer_worker,
                                       args=(policy, obs_next, box),
@@ -441,6 +458,10 @@ def main() -> None:
     p.add_argument("--image-server", default="192.168.123.164",
                    help="G1 PC2 image-server host (default 192.168.123.164)")
     p.add_argument("--prompt", default="pick the red bottle")
+    p.add_argument("--send-jpeg", action="store_true",
+                   help="Send compressed JPEG bytes instead of decoded RGB arrays "
+                        "(~12x smaller upload — fixes a network-bound wait_recv). "
+                        "REQUIRES the server to imdecode + BGR->RGB these image keys.")
     p.add_argument("--max-chunks", type=int, default=30,
                    help="How many action chunks to run before stopping")
     p.add_argument("--control-hz", type=float, default=15.0,
