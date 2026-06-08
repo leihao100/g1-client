@@ -175,11 +175,14 @@ class _FakeCam:
 
 # ---------- action analysis ----------
 
-def analyze_actions(actions, idx):
-    """Print shape + per-channel ranges, return a list of warning strings."""
+def analyze_actions(actions, idx, quiet=False):
+    """Return contract/NaN/unit warnings for one action chunk. quiet=False also
+    logs shape + per-channel ranges; quiet=True only collects warnings (the
+    reused main_openpi loop already prints ranges via log_chunk_ranges)."""
     warnings = []
     a = np.asarray(actions)
-    log.info(f"[infer {idx}] actions shape={a.shape} dtype={a.dtype}")
+    if not quiet:
+        log.info(f"[infer {idx}] actions shape={a.shape} dtype={a.dtype}")
 
     if a.ndim != 2:
         warnings.append(f"expected 2D [H, A], got ndim={a.ndim}")
@@ -194,7 +197,8 @@ def analyze_actions(actions, idx):
     arm = a[:, ARM_CHANNELS] if A >= 14 else a
     arm_min = arm.min(axis=0)
     arm_max = arm.max(axis=0)
-    log.info(f"[infer {idx}] arm joint ranges over H={H} (rad):")
+    if not quiet:
+        log.info(f"[infer {idx}] arm joint ranges over H={H} (rad):")
     for i, name in enumerate(ARM_JOINT_NAMES[:arm.shape[1]]):
         lo, hi = arm_min[i], arm_max[i]
         flag = ""
@@ -202,13 +206,15 @@ def analyze_actions(actions, idx):
             flag = "  <-- OUTSIDE controller clip range"
             warnings.append(f"{name.strip()} range [{lo:+.3f},{hi:+.3f}] "
                             f"exceeds limits [{ARM_JOINT_MIN[i]:+.2f},{ARM_JOINT_MAX[i]:+.2f}]")
-        log.info(f"    {name} min={lo:+.3f} max={hi:+.3f}{flag}")
+        if not quiet:
+            log.info(f"    {name} min={lo:+.3f} max={hi:+.3f}{flag}")
 
     if A > RIGHT_GRIPPER_CHANNEL:
         gl = a[:, LEFT_GRIPPER_CHANNEL]
         gr = a[:, RIGHT_GRIPPER_CHANNEL]
-        log.info(f"[infer {idx}] gripper L:[{gl.min():.2f},{gl.max():.2f}] "
-                 f"R:[{gr.min():.2f},{gr.max():.2f}]  (rad, valid [{GRIPPER_MIN},{GRIPPER_MAX}])")
+        if not quiet:
+            log.info(f"[infer {idx}] gripper L:[{gl.min():.2f},{gl.max():.2f}] "
+                     f"R:[{gr.min():.2f},{gr.max():.2f}]  (rad, valid [{GRIPPER_MIN},{GRIPPER_MAX}])")
         for tag, g in (("L", gl), ("R", gr)):
             if g.min() < GRIPPER_MIN - 1e-3 or g.max() > GRIPPER_MAX + 1e-3:
                 warnings.append(f"{tag} gripper outside [{GRIPPER_MIN},{GRIPPER_MAX}]")
@@ -227,99 +233,41 @@ def analyze_actions(actions, idx):
     return warnings
 
 
-def _pct(xs, p):
-    return float(np.percentile(xs, p)) if xs else float("nan")
-
-
-def _stat(xs):
-    """(min, p50, p95, max, mean) of a list of numbers."""
-    return (min(xs), _pct(xs, 50), _pct(xs, 95), max(xs), float(np.mean(xs)))
-
-
-def _extract_server_ms(result):
-    """Server-reported inference time (ms), if the server includes one in its
-    reply. Lets us split wait_recv into network vs on-GPU compute. Returns None
-    if the server doesn't report it."""
-    for k in ("server_timing", "policy_timing", "timing"):
-        v = result.get(k)
-        if isinstance(v, dict):
-            for tk, scale in (("infer_ms", 1.0), ("inference_ms", 1.0),
-                              ("infer_time_ms", 1.0), ("infer_s", 1e3),
-                              ("inference_s", 1e3)):
-                if tk in v:
-                    try:
-                        return float(v[tk]) * scale
-                    except (TypeError, ValueError):
-                        return None
-    return None
-
-
-# ---------- timing wrapper ----------
+# ---------- policy shim ----------
 
 class _TimingPolicy:
-    """Wraps PolicyClient.infer so the reused main_openpi loop times every call
-    and records the per-step breakdown from PolicyClient.last_timing (pack /
-    send / wait_recv / unpack + payload bytes). main_openpi's loop only calls
-    `.infer(obs)`, on the main thread (first chunk) and on prefetch daemon
-    threads (steady chunks), so the records are lock-guarded.
-
-    The breakdown is what localizes the bottleneck:
-      pack       — msgpack-serializing the obs (scales with the decoded-image
-                   payload; the 3 RGB frames dominate this)
-      send       — pushing the bytes onto the socket
-      wait_recv  — blocking recv = network-up + GPU compute + network-down
-                   (split further via server_ms if the server reports it)
-      unpack     — deserializing the returned action chunk
-    """
+    """Thin shim around PolicyClient for the reused main_openpi loop. It just
+    delegates infer (and exposes .last_timing so the loop can read its own
+    latency breakdown — main_openpi prints the per-step table now) and, on top,
+    runs the action contract/NaN/unit analysis the loop doesn't do. The loop
+    calls .infer on the main thread (first chunk) and prefetch daemon threads
+    (steady chunks), so the counters are lock-guarded."""
 
     def __init__(self, client):
         self._client = client
         self._lock = threading.Lock()
-        self.calls = []          # one breakdown dict per infer
         self.warnings = []
         self.nan_calls = 0
         self._n = 0
+
+    @property
+    def last_timing(self):
+        return self._client.last_timing
 
     def infer(self, obs):
         with self._lock:
             idx = self._n
             self._n += 1
-        t0 = time.perf_counter()
         result = self._client.infer(obs)
-        wall_ms = (time.perf_counter() - t0) * 1e3
-        tm = dict(self._client.last_timing or {})
-        server_ms = _extract_server_ms(result)
-
         ws = []
         if "actions" not in result:
             ws.append("missing 'actions' key")
         else:
             actions = np.asarray(result["actions"], dtype=np.float64)
-            ws = analyze_actions(actions, idx)
-        nan_hit = any("NaN" in w for w in ws)
-
-        rec = {
-            "wall_ms": wall_ms,
-            "pack_ms": tm.get("pack_s", 0.0) * 1e3,
-            "send_ms": tm.get("send_s", 0.0) * 1e3,
-            "wait_recv_ms": tm.get("wait_recv_s", 0.0) * 1e3,
-            "unpack_ms": tm.get("unpack_s", 0.0) * 1e3,
-            "server_ms": server_ms,
-            "bytes_sent": tm.get("bytes_sent", -1),
-            "bytes_recv": tm.get("bytes_recv", -1),
-        }
-        log.info(
-            f"[infer {idx}] wall={wall_ms:6.1f}ms  pack={rec['pack_ms']:5.1f} "
-            f"send={rec['send_ms']:5.1f} wait_recv={rec['wait_recv_ms']:6.1f} "
-            f"unpack={rec['unpack_ms']:5.1f}"
-            + (f" server={server_ms:6.1f}" if server_ms is not None else "")
-            + (f"  up={rec['bytes_sent']/1024:.0f}KiB down={rec['bytes_recv']/1024:.0f}KiB"
-               if rec['bytes_sent'] > 0 else ""))
-
+            ws = analyze_actions(actions, idx, quiet=True)
         with self._lock:
-            self.calls.append(rec)
             self.warnings += [f"infer {idx}: {w}" for w in ws]
-            if nan_hit:
+            if any("NaN" in w for w in ws):
                 self.nan_calls += 1
         return result
 
@@ -344,26 +292,21 @@ def run(args):
     log.info(f"Driving main_openpi._run_inference_loop with synthetic obs: "
              f"max_chunks={args.max_chunks} control_hz={args.control_hz} "
              f"prefetch_lead={args.prefetch_lead} blend_steps={args.blend_steps} "
-             f"chunk_align={args.chunk_align}")
-    loop_t0 = time.perf_counter()
+             f"chunk_align={args.chunk_align} send_jpeg={args.send_jpeg}")
     try:
+        # The loop itself prints the per-step latency breakdown + bottleneck +
+        # stall verdict (main_openpi._summarize_timing).
         _run_inference_loop(arm, grip, cam, policy, args)
     finally:
-        loop_wall = time.perf_counter() - loop_t0
         try:
             client.close()
         except Exception:
             pass
 
-    # ---- summary ----
-    calls = policy.calls
-    wall = [r["wall_ms"] for r in calls]
-    budget_ms = (args.prefetch_lead / args.control_hz) * 1e3
+    # ---- this harness adds: in-loop FPS + contract/NaN checks ----
     log.info("=" * 64)
-
-    # In-loop FPS: sub-steps dispatched per second (first→last dispatch). A
-    # chunk-boundary stall (infer > overlap window) leaves a gap with no
-    # dispatch, dragging this below the target control_hz.
+    # FPS: sub-steps dispatched per second (first→last dispatch). A chunk-
+    # boundary stall leaves a gap with no dispatch, dragging it below control_hz.
     if arm.steps > 1 and arm.t_last and arm.t_last > arm.t_first:
         span = arm.t_last - arm.t_first
         fps = (arm.steps - 1) / span
@@ -374,62 +317,17 @@ def run(args):
         if ratio < 0.95:
             log.warning(f"achieved {fps:.2f} fps is only {ratio*100:.0f}% of target "
                         f"{args.control_hz} — chunk-boundary stalls are dropping the rate.")
-    log.info(f"total loop wall: {loop_wall:.2f}s for {args.max_chunks} chunks")
 
-    # ---- per-step latency breakdown: find the bottleneck ----
-    if calls:
-        comps = [("pack", "pack_ms"), ("send", "send_ms"),
-                 ("wait_recv", "wait_recv_ms"), ("unpack", "unpack_ms"),
-                 ("wall(total)", "wall_ms")]
-        log.info(f"per-step latency over {len(calls)} infer calls (ms):")
-        log.info(f"  {'component':<14} {'min':>7} {'p50':>7} {'p95':>7} {'max':>7} {'mean':>7}")
-        means = {}
-        for label, key in comps:
-            mn, p50, p95, mx, me = _stat([r[key] for r in calls])
-            means[label] = me
-            log.info(f"  {label:<14} {mn:7.1f} {p50:7.1f} {p95:7.1f} {mx:7.1f} {me:7.1f}")
-
-        # server-reported GPU compute, if any -> split wait_recv into net vs gpu
-        srv = [r["server_ms"] for r in calls if r["server_ms"] is not None]
-        if srv:
-            mn, p50, p95, mx, me = _stat(srv)
-            log.info(f"  {'server_infer':<14} {mn:7.1f} {p50:7.1f} {p95:7.1f} {mx:7.1f} {me:7.1f}")
-            net = means["wait_recv"] - me
-            log.info(f"  => network (wait_recv - server_infer) ~= {net:.1f} ms mean "
-                     f"(GPU compute ~= {me:.1f} ms)")
-
-        # bottleneck = largest of the four client-visible sub-steps
-        sub = {k: means[k] for k in ("pack", "send", "wait_recv", "unpack")}
-        bn = max(sub, key=sub.get)
-        log.info(f"BOTTLENECK (mean): {bn} = {sub[bn]:.1f} ms "
-                 f"({sub[bn]/means['wall(total)']*100:.0f}% of total)")
-        if bn in ("pack", "send"):
-            up = np.mean([r["bytes_sent"] for r in calls if r["bytes_sent"] > 0])
-            log.info(f"  upload payload ~= {up/1024:.0f} KiB/infer — dominated by the 3 "
-                     f"decoded RGB frames. Sending JPEG bytes instead of decoded arrays "
-                     f"would cut pack+send ~10-15x.")
-
-        # overlap-budget verdict (drives the real loop's stall behaviour)
-        p95w = _pct(wall, 95)
-        over = sum(1 for x in wall if x > budget_ms)
-        log.info(f"overlap budget = prefetch_lead/control_hz = "
-                 f"{args.prefetch_lead}/{args.control_hz} = {budget_ms:.1f} ms")
-        if p95w > budget_ms:
-            log.warning(f"p95 wall {p95w:.1f} ms > budget {budget_ms:.1f} ms "
-                        f"({over}/{len(wall)} calls exceed) — loop STALLS at boundaries. "
-                        f"Raise --prefetch-lead / lower --control-hz, or fix the bottleneck above.")
-        else:
-            log.info(f"p95 wall within budget ({over}/{len(wall)} exceed) — no stall expected.")
-
+    n_infers = policy._n
     if policy.nan_calls:
-        log.warning(f"{policy.nan_calls}/{len(calls)} infer calls returned NaN/inf actions "
+        log.warning(f"{policy.nan_calls}/{n_infers} infer calls returned NaN/inf actions "
                     f"— checkpoint norm_stats or weights problem (synthetic obs is finite, "
                     f"so the server produced them).")
     if policy.warnings:
         log.warning(f"{len(policy.warnings)} contract warning(s):")
         for w in policy.warnings:
             log.warning(f"  - {w}")
-    elif calls:
+    elif n_infers:
         log.info("No contract warnings — obs/action looks consistent.")
     log.info("=" * 64)
 
