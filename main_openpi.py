@@ -208,11 +208,12 @@ def _summarize_timing(infer_recs, chunk_recs, args):
     bn = max(sub, key=sub.get)
     log.info(f"BOTTLENECK (mean): {bn} = {sub[bn]:.1f} ms "
              f"({sub[bn]/means['wall(total)']*100:.0f}% of infer total)")
-    if bn in ("pack", "send"):
-        up = [r["bytes_sent"] for r in infer_recs if r["bytes_sent"] > 0]
-        if up:
-            log.info(f"  upload payload ~= {np.mean(up)/1024:.0f} KiB/infer (decoded RGB "
-                     f"frames) — sending JPEG bytes would cut pack+send ~10-15x.")
+    up = [r["bytes_sent"] for r in infer_recs if r["bytes_sent"] > 0]
+    if up:
+        up_kib = np.mean(up) / 1024
+        log.info(f"  upload payload ~= {up_kib:.0f} KiB/infer"
+                 + ("  (large — decoded RGB; --send-jpeg cuts it ~10-15x)"
+                    if up_kib > 200 else "  (compressed)"))
     if chunk_recs:
         ex = [r["exec_s"] for r in chunk_recs]
         jw = [r["join_wait_s"] * 1e3 for r in chunk_recs]
@@ -356,7 +357,8 @@ def _run_inference_loop(arm, grip, cam, policy, args) -> None:
                  f"infer wall={rec['wall_ms']:.0f}ms pack={rec['pack_ms']:.0f} "
                  f"send={rec['send_ms']:.0f} wait_recv={rec['wait_recv_ms']:.0f} "
                  f"unpack={rec['unpack_ms']:.0f}"
-                 + (f" server={rec['server_ms']:.0f}" if rec['server_ms'] is not None else ""))
+                 + (f" server={rec['server_ms']:.0f}" if rec['server_ms'] is not None else "")
+                 + (f" up={rec['bytes_sent']/1024:.0f}KiB" if rec['bytes_sent'] > 0 else ""))
         log_chunk_ranges(c, next_actions)
         actions = next_actions
         start_idx = min(pending_skip, next_actions.shape[0] - 1)
