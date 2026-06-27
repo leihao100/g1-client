@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A standalone runtime inference client that drives a Unitree G1 humanoid's arms and grippers from action chunks produced by a remote LingBot-VA policy server.
 
-It depends on the Unitree Python SDK (`unitree_sdk2py`, CycloneDDS-backed) — installed separately as an external prerequisite (see Commands) — but is otherwise self-contained. `main.py`, `smoke_test.py`, and `test_async_loop.py` are entry-point scripts at the repo root; the controllers and clients live in the `g1_client/` package.
+It depends on the Unitree Python SDK (`unitree_sdk2py`, CycloneDDS-backed) — installed separately as an external prerequisite (see Commands) — but is otherwise self-contained. The repo is laid out as a **shared package plus one folder per model**: the controllers and transport (`arm_controller`, `gripper_controller`, `camera_client`, `policy_client`, `msgpack_numpy`) live in the `g1_client/` package, and each model has its own folder with a `main.py` entry script (`lingbot_va/` is the default/base model, plus `fastwam/`, `dit/`, `openpi/`). The base model's tests and replay (`smoke_test.py`, `test_async_loop.py`, `test_async_safety.py`, `test_policy_server.py`, `replay.py`) live in `lingbot_va/`. Every entry script inserts the repo root onto `sys.path` (a two-line bootstrap before the `from g1_client …` imports) so the shared package resolves regardless of the working directory.
 
 ## Commands
 
@@ -23,23 +23,23 @@ pip install -r requirements.txt
 Run the full pipeline (from the repo root):
 
 ```bash
-python main.py \
+python lingbot_va/main.py \
     --iface enp0s31f6 \
     --server-host <cloud-ip> \
     --server-port 29056 \
     --prompt "pick up the pink object and place it on the blue cross mark"
 ```
 
-`main.py` / `smoke_test.py` / `test_async_loop.py` import the `g1_client` package and are run directly from the repo root — Python finds the package because the script's own directory (the repo root) is on `sys.path`. Running them as `python -m ...` will NOT work.
+Each model's entry script is run directly from the repo root (`python lingbot_va/main.py`, `python fastwam/main.py`, etc.). They import the shared `g1_client` package; Python finds it because each script's `sys.path` bootstrap inserts the repo root. Running them as `python -m ...` will NOT work.
 
 Two contract tests (no robot, no DDS) — exit 0 on pass:
 
 ```bash
 # Wire-contract check against a running g1_async policy server (cloud round-trip).
-python smoke_test.py --server-host <cloud-ip> --server-port 29056
+python lingbot_va/smoke_test.py --server-host <cloud-ip> --server-port 29056
 
 # Offline check of the async loop's wire schedule using fakes (no server).
-python test_async_loop.py
+python lingbot_va/test_async_loop.py
 ```
 
 Both tests *pin the wire schedule* that `_run_inference_loop` is supposed to drive: `reset → cold_start → async_step` only, no `compute_kv_cache`, exact keyframe counts (0 / 4 / 8 / 8 / …), and verbatim identity on `state` / `executing_action`. They are deliberately strict because a desync between client and server (e.g. wrong keyframe count, wrong color order) corrupts the autoregressive context with no error — see "Wire-contract divergence" below for an active example.

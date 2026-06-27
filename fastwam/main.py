@@ -1,70 +1,77 @@
-"""Main inference loop for the G1, talking to a DiT4DiT
-deployment/model_server/server_policy.py (WebsocketPolicyServer) instead of an
-openpi serve_policy.py or the LingBot-VA cloud server.
+"""Main inference loop for the G1, talking to a FastWAM policy server
+(FastWAM/serve_fastwam_g1.py) — a client-server split like the openpi / DiT4DiT paths.
 
-WHAT CHANGED vs main_openpi.py
-------------------------------
+WHAT CHANGED vs main_openpi.py / main-dit.py
+--------------------------------------------
 Nothing in the robot control path. arm_controller.py, gripper_controller.py and
 camera_client.py are used verbatim, and the receding-horizon + one-chunk-prefetch
-loop is identical. Only the data send/receive changes:
+loop is identical. Only the policy server differs:
 
-  * OpenPIPolicy / raw PolicyClient (server un-normalizes, returns raw actions)
-        --> DitPolicy (server returns NORMALIZED actions and expects NORMALIZED
-            state, so this client carries dataset_statistics.json and does the
-            normalization on both ends, mirroring eval_policy.py).
-  * obs is three cameras (ego + 2 wrists), sent in OBS_CAM_KEYS order; the
-        server resizes each and concatenates them side-by-side into one
-        conditioning frame, matching UnitreeG1Dex1ThreeCamConfig training.
+  * OpenPIPolicy (openpi serve_policy.py) / DitPolicy (DiT4DiT server_policy.py)
+        --> FastWAMPolicy, talking to FastWAM/serve_fastwam_g1.py over the same
+            msgpack/WebSocket protocol (PolicyClient). FastWAM ships no server, so
+            FastWAM/serve_fastwam_g1.py wraps its in-process inference reference
+            (experiments/robotwin/.../deploy_policy.py) behind that protocol.
+  * Why a server at all: the FastWAM 5B model needs torch + a CUDA GPU, which
+        live in the `fastwam` conda env; the robot SDK (unitree_sdk2py) lives in
+        the `unitree` env. The split keeps this robot-side process torch-free.
+  * obs is three cameras [ego/head, left_wrist, right_wrist] sent in OBS_CAM_KEYS
+        order; the server concatenates them in the training "robotwin" layout
+        (head on top, the two wrists side-by-side below) into one (384,320) frame,
+        matching the G1 `pick_red` checkpoint's shape_meta.
 
 The robot init / standby / kp-switch / cleanup sequence is preserved exactly,
-because those are safety-critical and have nothing to do with the server.
+because those are safety-critical and have nothing to do with the policy.
 
 OBSERVATION / ACTION CONTRACT (must match the served checkpoint)
 ---------------------------------------------------------------
-  obs (sent every tick), assembled by build_obs and finished inside DitPolicy:
-    image    list of 3 RGB uint8 cameras [ego, left_wrist, right_wrist];
-             resized + side-by-side concatenated to (224, 672) server-side
-    state    float32 (16,) = [14 arm q | L grip | R grip], min-max normalized
-             to [-1,1] and padded to 64 server-side-expected dim
-    prompt   str
+  obs (built by build_obs, sent to the server):
+    image    list of 3 RGB uint8 cameras [cam_left_high, cam_left_wrist,
+             cam_right_wrist]; robotwin-concatenated to (384,320) server-side
+    state    float32 (16,) = [14 arm q | L grip | R grip], normalized by the
+             checkpoint's FastWAMProcessor (z-score) into the proprio condition
+    prompt   str (wrapped in FastWAM's DEFAULT_PROMPT template server-side)
 
-  action returned by the server: normalized [H, 32]; DitPolicy un-normalizes to
-  raw [H, 16]:
+  action returned by the server: un-normalized [H, 16] in raw units:
     [:, 0:14] absolute arm joint targets (rad), order == ARM_JOINTS
     [:, 14]   left gripper  (rad, [GRIPPER_MIN, GRIPPER_MAX])
     [:, 15]   right gripper (rad, [GRIPPER_MIN, GRIPPER_MAX])
 
-Precondition: robot already in 'ai' motion mode (set via the Unitree app).
+Precondition: robot already in 'ai' motion mode (set via the Unitree app), and
+FastWAM/serve_fastwam_g1.py is running (or will be — the client waits for it).
 
-Usage (run from the g1-client/ directory):
-  python main-dit.py \\
+Usage (run from the repo root):
+  python fastwam/main.py \\
       --iface enp0s31f6 \\
       --server-host 1.2.3.4 \\
-      --server-port 10093 \\
-      --norm-stats /path/to/<run_dir>/dataset_statistics.json \\
+      --server-port 8000 \\
       --prompt "pick the red bottle"
 """
 
 import argparse
 import logging
+import os
+import sys
 import threading
 import time
 
 import cv2
 import numpy as np
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root -> import g1_client
+
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 
 from g1_client.arm_controller import ArmController, INIT_POSE_READY
 from g1_client.gripper_controller import GripperController, GRIPPER_MIN, GRIPPER_MAX
 from g1_client.camera_client import CameraClient
-from g1_client.dit_policy import DitPolicy
+from fastwam_policy import FastWAMPolicy
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-log = logging.getLogger("g1_dit.main")
+log = logging.getLogger("g1_fastwam.main")
 
-# Action tensor layout for the G1 DiT checkpoint after un-normalization: [H, 16].
+# Action tensor layout for the G1 FastWAM checkpoint after un-normalization: [H, 16].
 ARM_CHANNELS = slice(0, 14)
 LEFT_GRIPPER_CHANNEL = 14
 RIGHT_GRIPPER_CHANNEL = 15
@@ -74,24 +81,24 @@ ARM_JOINT_NAMES = [
     "R_pitch", "R_roll ", "R_yaw ", "R_elbow", "R_wrR ", "R_wrP ", "R_wrY ",
 ]
 
-# The 3-camera G1 DiT checkpoint conditions on [ego, left_wrist, right_wrist],
-# concatenated side-by-side server-side. ORDER MUST MATCH the training video_keys
-# (UnitreeG1Dex1ThreeCamConfig: ego_view, left_wrist, right_wrist).
+# The 3-camera G1 FastWAM checkpoint (pick_red) conditions on
+# [cam_left_high, cam_left_wrist, cam_right_wrist]. ORDER MUST MATCH the training
+# shape_meta.images order — robotwin concat puts cam_left_high on top.
 OBS_CAM_KEYS = [
-    "observation.images.cam_left_high",    # ego / head (primary)
+    "observation.images.cam_left_high",    # ego / head (top of the concat)
     "observation.images.cam_left_wrist",   # left wrist
     "observation.images.cam_right_wrist",  # right wrist
 ]
 
 
-# ---------- observation assembly (the "receive" side) ----------
+# ---------- observation assembly ----------
 
 def _jpeg_to_rgb(jpeg_bytes: bytes) -> np.ndarray:
     """Decode the camera client's JPEG bytes back to an RGB uint8 array.
 
-    camera_client.get_obs_images() returns BGR-encoded JPEG. eval_policy.py feeds
-    the model LeRobot RGB frames, so we decode + BGR->RGB here to match, rather
-    than editing camera_client.py.
+    camera_client.get_obs_images() returns BGR-encoded JPEG. FastWAM is trained on
+    LeRobot RGB frames, so we decode + BGR->RGB here to match, rather than editing
+    camera_client.py.
     """
     arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
     bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -102,12 +109,11 @@ def _jpeg_to_rgb(jpeg_bytes: bytes) -> np.ndarray:
 
 def build_obs(cam: CameraClient, arm: ArmController, grip: GripperController,
               prompt: str) -> dict:
-    """Assemble one DiT observation from the (unchanged) controllers.
+    """Assemble one FastWAM observation from the (unchanged) controllers.
 
-    All three cameras are sent in OBS_CAM_KEYS order; the server resizes each to
-    the training resolution and concatenates them side-by-side into one
-    conditioning frame (matching the dataloader). The raw 16-dim state is
-    normalized inside DitPolicy (server expects normalized state).
+    All three cameras are sent in OBS_CAM_KEYS order; FastWAMPolicy resizes and
+    robotwin-concatenates them into the conditioning frame. The raw 16-dim state
+    is normalized inside FastWAMPolicy by the checkpoint's processor.
     """
     imgs = cam.get_obs_images()  # dict of JPEG bytes (BGR, q90), LeRobot keys
     views = [_jpeg_to_rgb(imgs[k]) for k in OBS_CAM_KEYS]
@@ -141,7 +147,7 @@ def _stat(xs):
 
 
 def _timing_rec(tm):
-    """Turn PolicyClient.last_timing into a uniform per-infer record (ms)."""
+    """Turn FastWAMPolicy.last_timing into a uniform per-infer record (ms)."""
     return {
         "wall_ms": tm.get("total_s", 0.0) * 1e3,
         "pack_ms": tm.get("pack_s", 0.0) * 1e3,
@@ -154,26 +160,20 @@ def _timing_rec(tm):
 
 
 def _summarize_timing(infer_recs, chunk_recs, args):
-    """Compact end-of-run latency summary (per-infer breakdown + execute/stall)."""
+    """Compact end-of-run latency summary (per-infer breakdown + execute/stall).
+
+    wait_recv is the blocking recv: network round-trip + the server's diffusion
+    sampler combined. For FastWAM the sampler dominates, so this is mostly GPU time.
+    """
     if not infer_recs:
         return
     budget_ms = (args.prefetch_lead / args.control_hz) * 1e3
     log.info("=" * 60)
     log.info(f"per-infer latency over {len(infer_recs)} calls (ms):")
-    comps = [("wall(total)", "wall_ms"), ("pack", "pack_ms"), ("send", "send_ms"),
-             ("wait_recv", "wait_recv_ms"), ("unpack", "unpack_ms")]
-    means = {}
+    comps = [("wall(total)", "wall_ms"), ("wait_recv(gpu)", "wait_recv_ms")]
     for label, key in comps:
         mn, p50, p95, mx, me = _stat([r[key] for r in infer_recs])
-        means[label.split("(")[0]] = me
-        log.info(f"  {label:<14} {mn:7.1f} {p50:7.1f} {p95:7.1f} {mx:7.1f} {me:7.1f}")
-    sub = {k: means[k] for k in ("pack", "send", "wait_recv", "unpack")}
-    bn = max(sub, key=sub.get)
-    log.info(f"  bottleneck: {bn} ~= {sub[bn]:.0f}ms "
-             f"({sub[bn]/means['wall']*100:.0f}% of infer total)")
-    up = [r["bytes_sent"] for r in infer_recs if r["bytes_sent"] > 0]
-    if up:
-        log.info(f"  upload payload ~= {np.mean(up)/1024:.0f} KiB/infer")
+        log.info(f"  {label:<16} {mn:7.1f} {p50:7.1f} {p95:7.1f} {mx:7.1f} {me:7.1f}")
     if chunk_recs:
         ex = [r["exec_s"] for r in chunk_recs]
         jw = [r["join_wait_s"] * 1e3 for r in chunk_recs]
@@ -181,10 +181,14 @@ def _summarize_timing(infer_recs, chunk_recs, args):
         log.info(f"execute/chunk: mean={np.mean(ex):.2f}s | join_wait: mean={np.mean(jw):.0f}ms "
                  f"p95={_pct(jw,95):.0f}ms | stalled {stalled}/{len(jw)} chunks "
                  f"(infer didn't finish within the {budget_ms:.0f}ms prefetch budget)")
+        if stalled:
+            log.warning(f"{stalled} chunk(s) STALLED at the boundary — FastWAM inference "
+                        f"is slower than the overlap window. Lower --control-hz, raise "
+                        f"--prefetch-lead, or cut --num-inference-steps.")
     log.info("=" * 60)
 
 
-def _infer_worker(policy: DitPolicy, obs: dict, box: dict) -> None:
+def _infer_worker(policy: FastWAMPolicy, obs: dict, box: dict) -> None:
     """Run one blocking infer on a daemon thread; stash result/exception/timing."""
     try:
         result = policy.infer(obs)
@@ -200,17 +204,21 @@ def _infer_worker(policy: DitPolicy, obs: dict, box: dict) -> None:
 def _run_inference_loop(arm, grip, cam, policy, args) -> None:
     """Receding-horizon loop with one-chunk prefetch + boundary smoothing.
 
-    Identical in structure to main_openpi.py: execute the current chunk at
-    args.control_hz on the main thread; when prefetch_lead steps remain, snapshot
-    a fresh obs and fire the next infer on a daemon thread so it overlaps the tail
-    of this chunk. Join, swap, repeat. The two anti-jitter measures (time
+    Identical in structure to main_openpi.py / main-dit.py: execute the current
+    chunk at args.control_hz on the main thread; when prefetch_lead steps remain,
+    snapshot a fresh obs and fire the next infer on a daemon thread so it overlaps
+    the tail of this chunk. Join, swap, repeat. The two anti-jitter measures (time
     alignment + cross-fade) are preserved unchanged.
+
+    Note: FastWAM is a heavy diffusion model — a full chunk's inference can take
+    longer than a fast policy. If chunks stall at the boundary, drop --control-hz
+    or --num-inference-steps (see the end-of-run summary's stall verdict).
     """
     dt = 1.0 / args.control_hz
     prompt = args.prompt
 
     # First chunk is a blocking infer (nothing to overlap it against yet).
-    log.info(f"First inference (prompt={prompt!r})")
+    log.info(f"First inference (prompt={prompt!r}) — FastWAM warm-up may be slow")
     result = policy.infer(build_obs(cam, arm, grip, prompt))
     actions = np.asarray(result["actions"], dtype=np.float64)
     if actions.ndim != 2 or actions.shape[1] < 16:
@@ -281,9 +289,7 @@ def _run_inference_loop(arm, grip, cam, policy, args) -> None:
         infer_recs.append(rec)
         chunk_recs.append({"exec_s": exec_s, "join_wait_s": join_wait_s})
         log.info(f"[chunk {c}] execute={exec_s:.2f}s join_wait={join_wait_s*1e3:.0f}ms | "
-                 f"infer wall={rec['wall_ms']:.0f}ms pack={rec['pack_ms']:.0f} "
-                 f"send={rec['send_ms']:.0f} wait_recv={rec['wait_recv_ms']:.0f} "
-                 f"unpack={rec['unpack_ms']:.0f}")
+                 f"infer wall={rec['wall_ms']:.0f}ms (gpu={rec['wait_recv_ms']:.0f}ms)")
         log_chunk_ranges(c, next_actions)
         actions = next_actions
         start_idx = min(pending_skip, next_actions.shape[0] - 1)
@@ -291,7 +297,7 @@ def _run_inference_loop(arm, grip, cam, policy, args) -> None:
     _summarize_timing(infer_recs, chunk_recs, args)
 
 
-# ---------- pipeline stages (kept identical to main_openpi.py) ----------
+# ---------- pipeline stages (kept identical to main-dit.py) ----------
 
 def _initialize_pose(arm, grip, args) -> None:
     log.info(f"Moving arms to ready pose over {args.init_duration:.1f}s "
@@ -314,7 +320,7 @@ def _wait_for_operator(args) -> None:
         return
     log.info("===============================================================")
     log.info("STANDBY: arms locked at ready pose.")
-    log.info("Set up the scene, then press [Enter] to connect and start.")
+    log.info("Set up the scene, then press [Enter] to start inference.")
     log.info("Press [Ctrl+C] at any time to abort safely.")
     log.info("===============================================================")
     try:
@@ -370,9 +376,9 @@ def run(args) -> None:
         _wait_for_operator(args)
         log.info(f"Switching arm kp to inference value: {args.inference_kp_arm}")
         arm.set_arm_kp(args.inference_kp_arm)
-        policy = DitPolicy(host=args.server_host, port=args.server_port,
-                           norm_stats_path=args.norm_stats, unnorm_key=args.unnorm_key,
-                           zero_gripper_state=args.zero_gripper_state)
+        # Connect after Enter (PolicyClient waits for the server if it isn't up yet,
+        # holding the arms at INIT_POSE_READY meanwhile — same as the openpi path).
+        policy = FastWAMPolicy(host=args.server_host, port=args.server_port)
         _run_inference_loop(arm, grip, cam, policy, args)
         _initialize_pose(arm, grip, args)
     finally:
@@ -382,19 +388,9 @@ def run(args) -> None:
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--iface", required=True, help="Network interface to robot, e.g. enp0s31f6")
-    p.add_argument("--server-host", required=True, help="DiT4DiT server_policy.py host or IP")
-    p.add_argument("--server-port", type=int, default=10093, help="DiT4DiT server port (default 10093)")
-    p.add_argument("--norm-stats", required=True,
-                   help="Path to the served checkpoint's dataset_statistics.json "
-                        "(run_dir/dataset_statistics.json). Used to normalize state "
-                        "and un-normalize actions client-side.")
-    p.add_argument("--unnorm-key", default=None,
-                   help="Dataset key inside dataset_statistics.json to use; omit if "
-                        "the checkpoint was trained on a single dataset.")
-    p.add_argument("--zero-gripper-state", action="store_true", dest="zero_gripper_state",
-                   help="Zero the two gripper state dims instead of sending the live "
-                        "gripper q. Only for checkpoints trained with constant-0 gripper "
-                        "state; this dataset's grippers vary, so the default sends live q.")
+    p.add_argument("--server-host", required=True, help="FastWAM/serve_fastwam_g1.py host or IP")
+    p.add_argument("--server-port", type=int, default=8000, help="FastWAM server port (default 8000)")
+    # ---- Robot I/O ----
     p.add_argument("--image-server", default="192.168.123.164",
                    help="G1 PC2 image-server host (default 192.168.123.164)")
     p.add_argument("--prompt", default="pick the red bottle")
@@ -412,7 +408,7 @@ def main() -> None:
                         "commanded pose so a chunk swap ramps in smoothly (0 disables)")
     p.add_argument("--no-chunk-align", action="store_false", dest="chunk_align",
                    help="Disable chunk time-alignment (execute every chunk from index 0).")
-    # ---- Safety / motion limits (same as main_openpi.py) ----
+    # ---- Safety / motion limits (same as main_openpi.py / main-dit.py) ----
     p.add_argument("--velocity-limit", type=float, default=8.0,
                    help="rad/s velocity cap on the per-tick motion clamp (default 8.0)")
     p.add_argument("--inference-kp-arm", type=float, default=80.0,

@@ -21,8 +21,8 @@ Pipeline:
           reality, FDM-imagines C_n, predicts C_{n+1}.
        Join B, rotate, repeat.
 
-Usage (run directly from inside the lingbot_g1_client/ directory):
-    python main.py \\
+Usage (run from the repo root):
+    python lingbot_va/main.py \\
         --iface enp0s31f6 \\
         --server-host 1.2.3.4 \\
         --server-port 29056 \\
@@ -41,6 +41,8 @@ import time
 import tty
 
 import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root -> import g1_client
 
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 

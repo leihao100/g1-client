@@ -35,11 +35,15 @@ Usage:
 
 import argparse
 import logging
+import os
+import sys
 import threading
 import time
 
 import cv2
 import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root -> import g1_client
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -277,7 +281,7 @@ class _TimingPolicy:
 def run(args):
     # Importing main_openpi pulls in unitree_sdk2py + teleimager (transitively),
     # but opens no DDS channel and touches no robot — we only call its loop.
-    from main_openpi import _run_inference_loop
+    from main import _run_inference_loop
 
     log.info(f"Connecting (PolicyClient) to ws://{args.server_host}:{args.server_port}")
     client = make_client(args)

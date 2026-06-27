@@ -16,15 +16,19 @@ chunk), then 4 then 8 keyframes. It needs a running CONFIG_NAME=g1_async
 server reachable at --server-host/--server-port; it cannot run without one
 (PolicyClient retries the connect forever).
 
-Usage (run directly from the repo root):
-    python smoke_test.py --server-host localhost --server-port 29536
+Usage (run from the repo root):
+    python lingbot_va/smoke_test.py --server-host localhost --server-port 29536
 """
 
 import argparse
 import logging
+import os
+import sys
 
 import cv2
 import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root -> import g1_client
 
 from g1_client.policy_client import PolicyClient
 

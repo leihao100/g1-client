@@ -21,7 +21,7 @@ import logging
 
 import numpy as np
 
-from .policy_client import PolicyClient
+from g1_client.policy_client import PolicyClient
 
 log = logging.getLogger("g1_fastwam.policy")
 

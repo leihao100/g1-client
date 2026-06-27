@@ -38,8 +38,8 @@ timestep. We cross-fade them with a weight that ramps the old:new ratio from
 so the freshly predicted chunk eases in instead of snapping. Whatever of the new
 chunk extends past the old plan (the non-overlapping tail) is appended verbatim.
 
-Usage (run from the g1-client/ directory):
-  python main_openpi_mask.py \\
+Usage (run from the repo root):
+  python openpi/main_mask.py \\
       --iface enp0s31f6 \\
       --server-host 1.2.3.4 \\
       --server-port 8000 \\
@@ -48,10 +48,14 @@ Usage (run from the g1-client/ directory):
 
 import argparse
 import logging
+import os
+import sys
 import threading
 import time
 
 import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root -> import g1_client
 
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 
@@ -62,7 +66,7 @@ from g1_client.policy_client import PolicyClient
 
 # Reuse everything that is identical to the plain openpi client — controllers are
 # untouched, only the scheduling/blending policy below is new.
-from main_openpi import (
+from main import (
     ARM_CHANNELS, LEFT_GRIPPER_CHANNEL, RIGHT_GRIPPER_CHANNEL,
     build_obs, log_chunk_ranges, _infer_worker,
     _initialize_pose, _wait_for_operator, _cleanup,
