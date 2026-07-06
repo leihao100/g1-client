@@ -125,6 +125,20 @@ def build_obs(cam: CameraClient, arm: ArmController, grip: GripperController,
     }
 
 
+def apply_raisez(actions: np.ndarray, raisez_mm: float) -> np.ndarray:
+    """Raise both EEF Z targets by raisez_mm (mm, pelvis frame) before IK.
+
+    Applied to every chunk right after it comes back from the server, so the
+    logged ranges and the dispatched targets both reflect the offset.
+    """
+    if raisez_mm:
+        actions = actions.copy()
+        dz = raisez_mm * 1e-3
+        actions[:, LEFT_EEF_CHANNELS.start + 2] += dz
+        actions[:, RIGHT_EEF_CHANNELS.start + 2] += dz
+    return actions
+
+
 def log_chunk_ranges(chunk_id: int, actions: np.ndarray) -> None:
     """One-line per-arm EEF range sanity print before a chunk streams to the arm."""
     gl = actions[:, LEFT_GRIPPER_CHANNEL]
@@ -279,6 +293,10 @@ def _run_inference_loop(arm, grip, cam, policy, kin, args) -> None:
     actions = np.asarray(result["actions"], dtype=np.float64)
     if actions.ndim != 2 or actions.shape[1] < 16:
         raise RuntimeError(f"Unexpected action shape {actions.shape} (want [H, 16])")
+    if args.raisez:
+        log.info(f"--raisez {args.raisez:.1f} mm: offsetting every EEF Z target by "
+                 f"{args.raisez*1e-3:+.4f} m (pelvis frame)")
+    actions = apply_raisez(actions, args.raisez)
     log_chunk_ranges(0, actions)
 
     infer_recs = [_timing_rec(dict(policy.last_timing or {}), _extract_server_ms(result))]
@@ -353,7 +371,7 @@ def _run_inference_loop(arm, grip, cam, policy, kin, args) -> None:
         join_wait_s = time.time() - join_t0
         if "err" in box:
             raise box["err"]
-        next_actions = box["actions"]
+        next_actions = apply_raisez(box["actions"], args.raisez)
 
         rec = _timing_rec(box.get("timing", {}), box.get("server_ms"))
         infer_recs.append(rec)
@@ -479,6 +497,9 @@ def main() -> None:
                    help="Send compressed JPEG bytes instead of decoded RGB arrays "
                         "(~12x smaller upload — fixes a network-bound wait_recv). "
                         "REQUIRES the server to imdecode + BGR->RGB these image keys.")
+    p.add_argument("--raisez", type=float, default=0.0,
+                   help="Raise every returned EEF Z target by this many mm (pelvis "
+                        "frame, both arms) before IK. Positive = higher. Default 0 (off).")
     p.add_argument("--max-chunks", type=int, default=30,
                    help="How many action chunks to run before stopping")
     p.add_argument("--control-hz", type=float, default=15.0,
