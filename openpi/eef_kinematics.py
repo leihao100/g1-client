@@ -20,11 +20,14 @@ predicted by a policy trained on FK data are (near-)exactly reachable, so a
 few Gauss-Newton steps per tick reach sub-mm residuals.
 """
 
+import os
+
 import numpy as np
 import pinocchio as pin
 
-DEFAULT_URDF = "/home/ur3-exp/unitree/xr_teleoperate/assets/g1/g1_body29_hand14.urdf"
-DEFAULT_ASSETS = "/home/ur3-exp/unitree/xr_teleoperate/assets/g1/"
+_ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets", "g1")
+DEFAULT_URDF = os.path.join(_ASSETS_DIR, "g1_body29_hand14.urdf")
+DEFAULT_ASSETS = _ASSETS_DIR
 EE_OFFSET = 0.05  # meters along wrist-yaw local x, same as G1_29_ArmIK
 
 ARM_JOINT_NAMES = [
