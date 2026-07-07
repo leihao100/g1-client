@@ -81,6 +81,37 @@ ARM_JOINT_NAMES = [
     "R_pitch", "R_roll ", "R_yaw ", "R_elbow", "R_wrR ", "R_wrP ", "R_wrY ",
 ]
 
+# IK residual (m) above which the --raisez Z-offset is loudly logged.
+IK_WARN_M = 0.02
+
+
+def apply_raisez(actions: np.ndarray, raisez_mm: float, kin) -> np.ndarray:
+    """Raise both EEF Z targets by raisez_mm (mm, pelvis frame) in joint space.
+
+    main.py's actions are absolute arm joint angles, not EEF poses, so a Z
+    offset can't be added directly. For each row we FK the 14 joints to the two
+    EEF poses, add dz to each Z, and IK back to joint targets — warm-started
+    from that row's own (un-raised) joints, so the small-dz solve converges in a
+    few iters and keeps the redundant elbow DOF on the same branch.
+    """
+    if not raisez_mm:
+        return actions
+    dz = raisez_mm * 1e-3
+    out = actions.copy()
+    ik_max_m = 0.0
+    for i in range(actions.shape[0]):
+        q = actions[i, ARM_CHANNELS]
+        left, right = kin.fk(q)
+        left[2] += dz
+        right[2] += dz
+        q_new, pos_err = kin.solve_ik(left, right, q)
+        out[i, ARM_CHANNELS] = q_new
+        ik_max_m = max(ik_max_m, pos_err)
+    if ik_max_m > IK_WARN_M:
+        log.warning(f"--raisez IK residual up to {ik_max_m*1e3:.1f} mm — a raised "
+                    f"EEF target was barely reachable")
+    return out
+
 
 # ---------- observation assembly (the "receive" side) ----------
 
@@ -253,7 +284,7 @@ def _infer_worker(policy: PolicyClient, obs: dict, box: dict) -> None:
         box["err"] = e
 
 
-def _run_inference_loop(arm, grip, cam, policy, args) -> None:
+def _run_inference_loop(arm, grip, cam, policy, kin, args) -> None:
     """Receding-horizon loop with one-chunk prefetch + boundary smoothing.
 
     Execute the current chunk at args.control_hz on the main thread; when
@@ -284,6 +315,10 @@ def _run_inference_loop(arm, grip, cam, policy, args) -> None:
     actions = np.asarray(result["actions"],dtype=np.float64)
     if actions.ndim != 2 or actions.shape[1] < 16:
         raise RuntimeError(f"Unexpected action shape {actions.shape} (want [H, 16])")
+    if args.raisez:
+        log.info(f"--raisez {args.raisez:.1f} mm: FK->+{args.raisez*1e-3:.4f}m Z->IK "
+                 f"on every chunk (pelvis frame, both arms)")
+    actions = apply_raisez(actions, args.raisez, kin)
     log_chunk_ranges(0, actions)
 
     # Latency profiling: same per-step breakdown as test_policy_server, plus the
@@ -352,7 +387,7 @@ def _run_inference_loop(arm, grip, cam, policy, args) -> None:
         join_wait_s = time.time() - join_t0
         if "err" in box:
             raise box["err"]
-        next_actions = box["actions"]
+        next_actions = apply_raisez(box["actions"], args.raisez, kin)
 
         rec = _timing_rec(box.get("timing", {}), box.get("server_ms"))
         infer_recs.append(rec)
@@ -433,6 +468,15 @@ def _cleanup(arm, grip, cam, policy) -> None:
 
 
 def run(args) -> None:
+    # Kinematics are only needed for --raisez; loaded lazily so the default
+    # (raisez=0) path keeps main.py's zero-pinocchio dependency footprint.
+    kin = None
+    if args.raisez:
+        from eef_kinematics import G1DualArmKinematics, DEFAULT_URDF, DEFAULT_ASSETS
+        urdf = args.urdf or DEFAULT_URDF
+        log.info(f"Loading G1 dual-arm model from {urdf} (for --raisez FK/IK)")
+        kin = G1DualArmKinematics(urdf, args.assets or DEFAULT_ASSETS)
+
     log.info(f"Initializing DDS on {args.iface}")
     ChannelFactoryInitialize(0, args.iface)
 
@@ -450,7 +494,7 @@ def run(args) -> None:
         log.info(f"Switching arm kp to inference value: {args.inference_kp_arm}")
         arm.set_arm_kp(args.inference_kp_arm)
         policy = PolicyClient(host=args.server_host, port=args.server_port)
-        _run_inference_loop(arm, grip, cam, policy, args)
+        _run_inference_loop(arm, grip, cam, policy, kin, args)
         _initialize_pose(arm, grip, args)
     finally:
         _cleanup(arm, grip, cam, policy)
@@ -468,6 +512,15 @@ def main() -> None:
                    help="Send compressed JPEG bytes instead of decoded RGB arrays "
                         "(~12x smaller upload — fixes a network-bound wait_recv). "
                         "REQUIRES the server to imdecode + BGR->RGB these image keys.")
+    p.add_argument("--raisez", type=float, default=0.0,
+                   help="Raise every EEF Z target by this many mm (pelvis frame, both "
+                        "arms) before dispatch. Since actions here are joint angles, "
+                        "this runs a per-step FK->+dz->IK round trip. Default 0 (off, "
+                        "no kinematics loaded).")
+    p.add_argument("--urdf", default=None,
+                   help="G1 URDF for --raisez FK/IK (defaults to the packaged model)")
+    p.add_argument("--assets", default=None,
+                   help="Mesh assets dir for --raisez (defaults to the packaged dir)")
     p.add_argument("--max-chunks", type=int, default=30,
                    help="How many action chunks to run before stopping")
     p.add_argument("--control-hz", type=float, default=15.0,
