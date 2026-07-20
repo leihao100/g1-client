@@ -70,6 +70,14 @@ def _do_fsm(loco: LocoController) -> None:
         loco.set_fsm(int(fsm))
 
 
+def _do_status(loco: LocoController) -> None:
+    """Read back current FSM / balance / stand height to diagnose no-ops."""
+    print(f"  fsm_id       = {loco.get_fsm_id()}")
+    print(f"  fsm_mode     = {loco.get_fsm_mode()}")
+    print(f"  balance_mode = {loco.get_balance_mode()}")
+    print(f"  stand_height = {loco.get_stand_height()}")
+
+
 # (label, handler). Handlers take the controller; menu-only entries wrap methods.
 MENU = [
     ("start (enter locomotion)", lambda l: l.start()),
@@ -86,6 +94,7 @@ MENU = [
     ("set balance mode ...", _do_balance),
     ("move ...", _do_move),
     ("stop move", lambda l: l.stop_move()),
+    ("status (read fsm/balance/height)", _do_status),
 ]
 
 

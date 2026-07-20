@@ -18,9 +18,16 @@ The velocity/height clamps below are conservative software limits on top of
 whatever the firmware enforces — tighten, don't widen, without a specific reason.
 """
 
+import json
 import logging
 
 from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
+from unitree_sdk2py.g1.loco.g1_loco_api import (
+    ROBOT_API_ID_LOCO_GET_FSM_ID,
+    ROBOT_API_ID_LOCO_GET_FSM_MODE,
+    ROBOT_API_ID_LOCO_GET_BALANCE_MODE,
+    ROBOT_API_ID_LOCO_GET_STAND_HEIGHT,
+)
 
 
 log = logging.getLogger("g1_wbc.loco")
@@ -64,6 +71,29 @@ class LocoController:
         self.client = LocoClient()
         self.client.SetTimeout(timeout)
         self.client.Init()
+
+    # ---------------- read-back (diagnostics) ----------------
+    # The G1 python LocoClient registers these GET apis but exposes no getters,
+    # so we call the underlying RPC directly (same pattern as the H2 client).
+
+    def _get(self, api_id: int):
+        """Return (code, value). value is None if the RPC failed (code != 0)."""
+        code, data = self.client._Call(api_id, json.dumps({}))
+        if code != 0:
+            return code, None
+        return code, json.loads(data).get("data")
+
+    def get_fsm_id(self):
+        return self._get(ROBOT_API_ID_LOCO_GET_FSM_ID)
+
+    def get_fsm_mode(self):
+        return self._get(ROBOT_API_ID_LOCO_GET_FSM_MODE)
+
+    def get_balance_mode(self):
+        return self._get(ROBOT_API_ID_LOCO_GET_BALANCE_MODE)
+
+    def get_stand_height(self):
+        return self._get(ROBOT_API_ID_LOCO_GET_STAND_HEIGHT)
 
     # ---------------- FSM ----------------
 
