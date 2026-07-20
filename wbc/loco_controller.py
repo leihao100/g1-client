@@ -22,6 +22,9 @@ import json
 import logging
 
 from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
+from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import (
+    MotionSwitcherClient,
+)
 from unitree_sdk2py.g1.loco.g1_loco_api import (
     ROBOT_API_ID_LOCO_GET_FSM_ID,
     ROBOT_API_ID_LOCO_GET_FSM_MODE,
@@ -71,6 +74,33 @@ class LocoController:
         self.client = LocoClient()
         self.client.SetTimeout(timeout)
         self.client.Init()
+
+        # The loco FSM only accepts SetFsmId / SetStandHeight / SetBalanceMode
+        # once a motion mode is selected (otherwise every loco call returns
+        # 7301 LOCOSTATE_NOT_AVAILABLE). Mode selection goes through this
+        # service, NOT SetFsmId. Equivalent to picking a mode in the Unitree app.
+        self.msc = MotionSwitcherClient()
+        self.msc.SetTimeout(timeout)
+        self.msc.Init()
+
+    # ---------------- motion mode (must be selected before anything else) ----
+
+    def check_mode(self):
+        """Return (code, info_dict) — current active motion mode, or None."""
+        return self.msc.CheckMode()
+
+    def select_mode(self, name: str = "normal"):
+        """Activate a motion mode so the loco FSM comes alive. Common names:
+        'normal' (classic locomotion), 'ai' (RL controller, used by the arm_sdk
+        path), 'advanced'. Returns the RPC code (0 == ok)."""
+        log.info("SelectMode(%r)", name)
+        code, _ = self.msc.SelectMode(name)
+        return code
+
+    def release_mode(self):
+        """Release the active motion mode (robot drops out of loco control)."""
+        code, _ = self.msc.ReleaseMode()
+        return code
 
     # ---------------- read-back (diagnostics) ----------------
     # The G1 python LocoClient registers these GET apis but exposes no getters,

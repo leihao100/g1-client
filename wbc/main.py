@@ -11,8 +11,10 @@ motion mode that accepts loco commands (set via the Unitree app). Do NOT run thi
 at the same time as an arm_sdk body-lock path — they contend for leg/waist
 authority.
 
-WARNING: this makes the robot move/step. Clear the area first. Keep the remote's
-emergency stop within reach; `damp` (option 1) drops it to a safe limp state.
+WARNING: this makes the robot move/step. Clear the area first, and keep the
+remote's emergency stop within reach. Note: `damp` drops all leg torque and the
+robot goes limp (it will collapse if not on a rack) — on quit ('q') this tool
+instead stops and holds a standing balance posture (FSM 500), never damps.
 
 Run from the repo root:
 
@@ -70,8 +72,17 @@ def _do_fsm(loco: LocoController) -> None:
         loco.set_fsm(int(fsm))
 
 
+def _do_select_mode(loco: LocoController) -> None:
+    name = input("  mode name (normal / ai / advanced) [normal]: ").strip() or "normal"
+    code = loco.select_mode(name)
+    print(f"  SelectMode({name!r}) -> code {code}")
+
+
 def _do_status(loco: LocoController) -> None:
-    """Read back current FSM / balance / stand height to diagnose no-ops."""
+    """Read back current mode + FSM / balance / stand height to diagnose no-ops.
+    balance/height returning code 7301 means no motion mode is active — run
+    'select motion mode' first."""
+    print(f"  motion_mode  = {loco.check_mode()}")
     print(f"  fsm_id       = {loco.get_fsm_id()}")
     print(f"  fsm_mode     = {loco.get_fsm_mode()}")
     print(f"  balance_mode = {loco.get_balance_mode()}")
@@ -80,6 +91,8 @@ def _do_status(loco: LocoController) -> None:
 
 # (label, handler). Handlers take the controller; menu-only entries wrap methods.
 MENU = [
+    ("select motion mode ... (DO THIS FIRST)", _do_select_mode),
+    ("release motion mode", lambda l: l.release_mode()),
     ("start (enter locomotion)", lambda l: l.start()),
     ("damp (safe limp)", lambda l: l.damp()),
     ("zero torque", lambda l: l.zero_torque()),
@@ -131,11 +144,13 @@ def run(iface: str, timeout: float) -> None:
             print(f"  (rpc returned code {code})")
         time.sleep(0.2)
 
-    # Leave the robot in a safe, non-moving state on exit.
-    print("Stopping and damping before exit ...")
+    # Leave the robot standing on exit — stop moving, then hold the balance-stand
+    # posture (FSM 500). Deliberately NOT damp(): damping drops all leg torque and
+    # the robot collapses, which can damage it when it isn't on a rack.
+    print("Stopping and returning to standing balance before exit ...")
     loco.stop_move()
     time.sleep(0.2)
-    loco.damp()
+    loco.start()
 
 
 def main() -> None:
