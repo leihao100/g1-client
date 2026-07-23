@@ -308,6 +308,12 @@ def _run_inference_loop(arm, grip, cam, policy, kin, args) -> None:
     if args.send_jpeg:
         log.warning("--send-jpeg ON: sending compressed JPEG bytes. The SERVER must "
                     "imdecode + cv2.COLOR_BGR2RGB these keys, or it sees garbage.")
+    if args.tauff_scale > 0:
+        log.info(f"gravity feedforward ON (--tauff-scale {args.tauff_scale}): the arm "
+                 f"holds commanded poses against gravity, matching collection dynamics")
+    else:
+        log.warning("gravity feedforward OFF (--tauff-scale 0): the arm will sag below "
+                    "commanded poses — state feedback drifts out of the training distribution")
 
     # First chunk is a blocking infer (nothing to overlap it against yet).
     log.info(f"First inference (prompt={prompt!r})")
@@ -357,6 +363,11 @@ def _run_inference_loop(arm, grip, cam, policy, kin, args) -> None:
                 alpha = (i + 1) / (args.blend_steps + 1)
                 a = (1.0 - alpha) * last_cmd + alpha * a
             arm.set_arm_target(a[ARM_CHANNELS])
+            # Gravity feedforward: hold the commanded pose instead of sagging
+            # under kp — matches the collection-time dynamics (tau=sol_tauff) the
+            # policy was trained on, so state feedback stays in-distribution.
+            if args.tauff_scale > 0:
+                arm.set_arm_tauff(kin.gravity_torque(a[ARM_CHANNELS], args.tauff_scale))
             grip.set_targets(
                 float(np.clip(a[LEFT_GRIPPER_CHANNEL], GRIPPER_MIN, GRIPPER_MAX)),
                 float(np.clip(a[RIGHT_GRIPPER_CHANNEL], GRIPPER_MIN, GRIPPER_MAX)),
@@ -402,6 +413,10 @@ def _run_inference_loop(arm, grip, cam, policy, kin, args) -> None:
         actions = next_actions
         start_idx = min(pending_skip, next_actions.shape[0] - 1)
 
+    # Drop the feedforward before run() ramps back to the ready pose, so that
+    # move runs with the arm's default (tau=0) dynamics.
+    if args.tauff_scale > 0:
+        arm.set_arm_tauff(np.zeros(14))
     _summarize_timing(infer_recs, chunk_recs, args)
 
 
@@ -471,10 +486,10 @@ def run(args) -> None:
     # Kinematics are only needed for --raisez; loaded lazily so the default
     # (raisez=0) path keeps main.py's zero-pinocchio dependency footprint.
     kin = None
-    if args.raisez:
+    if args.raisez or args.tauff_scale > 0:
         from eef_kinematics import G1DualArmKinematics, DEFAULT_URDF, DEFAULT_ASSETS
         urdf = args.urdf or DEFAULT_URDF
-        log.info(f"Loading G1 dual-arm model from {urdf} (for --raisez FK/IK)")
+        log.info(f"Loading G1 dual-arm model from {urdf} (--raisez FK/IK and/or gravity feedforward)")
         kin = G1DualArmKinematics(urdf, args.assets or DEFAULT_ASSETS)
 
     log.info(f"Initializing DDS on {args.iface}")
@@ -518,9 +533,15 @@ def main() -> None:
                         "this runs a per-step FK->+dz->IK round trip. Default 0 (off, "
                         "no kinematics loaded).")
     p.add_argument("--urdf", default=None,
-                   help="G1 URDF for --raisez FK/IK (defaults to the packaged model)")
+                   help="G1 URDF for --raisez FK/IK and gravity feedforward (defaults to the packaged model)")
     p.add_argument("--assets", default=None,
-                   help="Mesh assets dir for --raisez (defaults to the packaged dir)")
+                   help="Mesh assets dir for --raisez / gravity feedforward (defaults to the packaged dir)")
+    p.add_argument("--tauff-scale", type=float, default=1.0,
+                   help="Scale on the gravity-compensation feedforward torque fed to the "
+                        "arm each step (default 1.0 = full comp, matching how the data was "
+                        "collected). Use <1 (e.g. 0.5) for a cautious first pass, or 0 to "
+                        "disable (the arm then sags and state feedback drifts OOD). Loads "
+                        "pinocchio on the default path.")
     p.add_argument("--max-chunks", type=int, default=30,
                    help="How many action chunks to run before stopping")
     p.add_argument("--control-hz", type=float, default=15.0,

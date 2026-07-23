@@ -21,6 +21,8 @@ whatever the firmware enforces — tighten, don't widen, without a specific reas
 import json
 import logging
 
+from unitree_sdk2py.core.channel import ChannelSubscriber
+from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
 from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
 from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import (
     MotionSwitcherClient,
@@ -36,14 +38,18 @@ from unitree_sdk2py.g1.loco.g1_loco_api import (
 log = logging.getLogger("g1_wbc.loco")
 
 
-# ---- FSM ids (from g1_loco_client.py's named helpers) ----
+# ---- FSM ids VERIFIED on this robot's firmware (2026-07) by direct testing.
+# These differ from the ids in the bundled g1_loco_client.py, which target an
+# OLDER firmware: its Squat2StandUp/StandUp2Squat=706 and Lie2StandUp=702 are
+# NOT recognized here (sending them is a no-op). Use the numeric ids below. ----
 class Fsm:
-    ZERO_TORQUE = 0     # LocoClient.ZeroTorque()
-    DAMP = 1            # LocoClient.Damp()        — soft/limp, safe to leave in
-    SIT = 3            # LocoClient.Sit()
-    START = 500         # LocoClient.Start()       — main locomotion control
-    LIE_TO_STANDUP = 702    # LocoClient.Lie2StandUp()  (robot face-up, hard flat floor)
-    SQUAT_STANDUP = 706     # LocoClient.Squat2StandUp() / StandUp2Squat() (same id)
+    ZERO_TORQUE = 0   # verified
+    DAMP = 1          # verified — soft/limp; robot COLLAPSES if not on a rack
+    SQUAT = 2         # verified — squat down
+    SIT = 3           # from SDK, not re-verified on this firmware
+    GET_READY = 4     # verified — slowly returns toward the standing pose (stand up)
+    START = 500       # regular locomotion, 1-DoF waist (docs note: jittery)
+    REGULAR = 501     # regular locomotion, 3-DoF waist (smooth); the remote's walk state
 
 
 # ---- Balance modes (firmware convention; confirm against your firmware doc) ----
@@ -67,6 +73,15 @@ def _clip(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
 
+# Leg joint indices on rt/lowstate (same order as arm_controller.G1JointIndex).
+# These pitch joints in the sagittal plane are what actually set the crouch depth.
+LEG_PITCH_JOINTS = {
+    "L_hip_pitch": 0, "L_knee": 3, "L_ankle_pitch": 4,
+    "R_hip_pitch": 6, "R_knee": 9, "R_ankle_pitch": 10,
+}
+kTopicLowState = "rt/lowstate"
+
+
 class LocoController:
     """High-level lower-body control for the G1 via the loco RPC service."""
 
@@ -82,6 +97,26 @@ class LocoController:
         self.msc = MotionSwitcherClient()
         self.msc.SetTimeout(timeout)
         self.msc.Init()
+
+        # Lazily-opened lowstate subscriber. GET_STAND_HEIGHT is unimplemented on
+        # this firmware (returns 7301), so the only way to see how low the robot
+        # is standing is the leg joint angles read straight off rt/lowstate.
+        self._lowstate_sub = None
+
+    # ---------------- leg pose read-back (crouch depth) ----------------
+
+    def get_leg_angles(self):
+        """Return {joint: radians} for the six sagittal leg pitch joints, or None
+        if no lowstate has arrived yet. Knee angle is the clearest crouch measure:
+        larger |knee| == squatting lower. This is the reliable substitute for the
+        dead GET_STAND_HEIGHT RPC."""
+        if self._lowstate_sub is None:
+            self._lowstate_sub = ChannelSubscriber(kTopicLowState, LowState_)
+            self._lowstate_sub.Init()
+        msg = self._lowstate_sub.Read()
+        if msg is None:
+            return None
+        return {name: msg.motor_state[idx].q for name, idx in LEG_PITCH_JOINTS.items()}
 
     # ---------------- motion mode (must be selected before anything else) ----
 
@@ -141,20 +176,23 @@ class LocoController:
     def sit(self) -> int:
         return self.set_fsm(Fsm.SIT)
 
+    def squat(self) -> int:
+        """Squat down (verified id 2)."""
+        return self.set_fsm(Fsm.SQUAT)
+
+    def stand_up(self) -> int:
+        """Return toward the standing pose (verified id 4). Slow, safe recovery
+        from a squat; never goes limp."""
+        return self.set_fsm(Fsm.GET_READY)
+
+    def regular(self) -> int:
+        """Regular locomotion, 3-DoF waist (id 501) — the walk-ready state where
+        move() works. Preferred over start()/500, which is jittery."""
+        return self.set_fsm(Fsm.REGULAR)
+
     def start(self) -> int:
-        """Enter main locomotion control (must be here before move())."""
+        """Regular locomotion, 1-DoF waist (id 500). Prefer regular()/501."""
         return self.set_fsm(Fsm.START)
-
-    def squat_to_standup(self) -> int:
-        return self.set_fsm(Fsm.SQUAT_STANDUP)
-
-    def standup_to_squat(self) -> int:
-        return self.set_fsm(Fsm.SQUAT_STANDUP)
-
-    def lie_to_standup(self) -> int:
-        """Stand up from lying down. Requires robot face-up on hard, flat, rough
-        ground — same precondition as the SDK example."""
-        return self.set_fsm(Fsm.LIE_TO_STANDUP)
 
     # ---------------- height ----------------
 

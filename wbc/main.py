@@ -86,20 +86,26 @@ def _do_status(loco: LocoController) -> None:
     print(f"  fsm_id       = {loco.get_fsm_id()}")
     print(f"  fsm_mode     = {loco.get_fsm_mode()}")
     print(f"  balance_mode = {loco.get_balance_mode()}")
-    print(f"  stand_height = {loco.get_stand_height()}")
+    print(f"  stand_height = {loco.get_stand_height()}  (7301 = unimplemented on this firmware)")
+    angles = loco.get_leg_angles()
+    if angles is None:
+        print("  leg_angles   = (no rt/lowstate yet)")
+    else:
+        print("  leg_angles(rad):")
+        for name, q in angles.items():
+            print(f"    {name:14s} {q:+.3f}")
 
 
 # (label, handler). Handlers take the controller; menu-only entries wrap methods.
 MENU = [
     ("select motion mode ... (DO THIS FIRST)", _do_select_mode),
-    ("release motion mode", lambda l: l.release_mode()),
-    ("start (enter locomotion)", lambda l: l.start()),
-    ("damp (safe limp)", lambda l: l.damp()),
+    ("release motion mode (LIMP - will collapse)", lambda l: l.release_mode()),
+    ("squat down (id 2)", lambda l: l.squat()),
+    ("stand up (id 4)", lambda l: l.stand_up()),
+    ("regular locomotion / walk-ready (id 501)", lambda l: l.regular()),
+    ("damp (LIMP - will collapse if not on a rack)", lambda l: l.damp()),
     ("zero torque", lambda l: l.zero_torque()),
     ("sit", lambda l: l.sit()),
-    ("squat -> stand up", lambda l: l.squat_to_standup()),
-    ("stand up -> squat", lambda l: l.standup_to_squat()),
-    ("lie -> stand up", lambda l: l.lie_to_standup()),
     ("set raw FSM id ...", _do_fsm),
     ("high stand", lambda l: l.high_stand()),
     ("low stand", lambda l: l.low_stand()),
@@ -144,13 +150,13 @@ def run(iface: str, timeout: float) -> None:
             print(f"  (rpc returned code {code})")
         time.sleep(0.2)
 
-    # Leave the robot standing on exit — stop moving, then hold the balance-stand
-    # posture (FSM 500). Deliberately NOT damp(): damping drops all leg torque and
-    # the robot collapses, which can damage it when it isn't on a rack.
-    print("Stopping and returning to standing balance before exit ...")
+    # Leave the robot standing on exit — stop moving, then return to the standing
+    # pose (FSM 4, verified). Deliberately NOT damp(): damping drops all leg torque
+    # and the robot collapses, which can damage it when it isn't on a rack.
+    print("Stopping and returning to standing pose before exit ...")
     loco.stop_move()
     time.sleep(0.2)
-    loco.start()
+    loco.stand_up()
 
 
 def main() -> None:

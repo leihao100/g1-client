@@ -29,6 +29,10 @@ _ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "as
 DEFAULT_URDF = os.path.join(_ASSETS_DIR, "g1_body29_hand14.urdf")
 DEFAULT_ASSETS = _ASSETS_DIR
 EE_OFFSET = 0.05  # meters along wrist-yaw local x, same as G1_29_ArmIK
+# Safety clip on the gravity feedforward torque (N·m per arm joint). G1 arm
+# static gravity torques sit well under this; the clip just guards against a bad
+# rnea result ever reaching the motors.
+TAUFF_CLIP_NM = 30.0
 
 ARM_JOINT_NAMES = [
     "left_shoulder_pitch_joint", "left_shoulder_roll_joint",
@@ -75,12 +79,27 @@ class G1DualArmKinematics:
         self.r_id = self.model.getFrameId("R_ee")
         self.q_lo = self.model.lowerPositionLimit
         self.q_hi = self.model.upperPositionLimit
+        self._zeros_v = np.zeros(self.model.nv)  # reused for the static rnea call
 
     def fk(self, q14: np.ndarray):
         """14 joint angles -> (left, right) EEF poses, each (x,y,z,qx,qy,qz,qw)."""
         pin.framesForwardKinematics(self.model, self.data, np.asarray(q14, dtype=np.float64))
         return (pin.SE3ToXYZQUAT(self.data.oMf[self.l_id]),
                 pin.SE3ToXYZQUAT(self.data.oMf[self.r_id]))
+
+    def gravity_torque(self, q14: np.ndarray, scale: float = 1.0) -> np.ndarray:
+        """Static gravity-compensation joint torque g(q) for the 14 arm joints
+        (N·m, order == ARM_JOINTS), scaled and clipped to ±TAUFF_CLIP_NM.
+
+        rnea(q, v=0, a=0) on the reduced arm model is the g(q) term — the torque
+        needed to hold pose q against gravity. Feed it to
+        ArmController.set_arm_tauff so the arm holds the commanded pose instead of
+        sagging under a finite kp; this is the same quantity xr_teleoperate feeds
+        as motor tau at collection time (arm_ik's sol_tauff), so applying it makes
+        the robot's dynamics match the data the policy was trained on."""
+        q = np.asarray(q14, dtype=np.float64)
+        tau = pin.rnea(self.model, self.data, q, self._zeros_v, self._zeros_v)
+        return np.clip(tau * scale, -TAUFF_CLIP_NM, TAUFF_CLIP_NM)
 
     def solve_ik(self, left_pose7, right_pose7, q_init,
                  max_iters: int = 20, tol: float = 1e-5, damping: float = 1e-8):

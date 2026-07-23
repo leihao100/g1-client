@@ -89,10 +89,6 @@ RIGHT_GRIPPER_CHANNEL = 15
 
 # IK residual (m) above which a converted EEF frame is loudly flagged.
 IK_WARN_M = 0.02
-# Safety clip on the gravity feedforward torque (N·m per arm joint). The G1 arm
-# static gravity torques sit well under this; the clip just guards against a bad
-# rnea result ever reaching the motors.
-TAUFF_CLIP_NM = 30.0
 
 ARM_JOINT_NAMES = [
     "L_pitch", "L_roll ", "L_yaw ", "L_elbow", "L_wrR ", "L_wrP ", "L_wrY ",
@@ -179,22 +175,17 @@ def compute_gravity_tauff(actions_joint: np.ndarray, kin, scale: float) -> np.nd
     which is why the demonstration didn't sag; feeding it here makes replay match.
 
     Solved up front (like the IK) so nothing runs pinocchio in the streaming hot
-    loop, and so the torque range is visible before the arm moves. Clipped to
-    ±TAUFF_CLIP_NM as a safety guard and scaled by `scale`.
+    loop, and so the torque range is visible before the arm moves. The per-frame
+    g(q)+clip is kin.gravity_torque (shared with the inference paths).
     """
-    import pinocchio as pin
-    out = np.empty((actions_joint.shape[0], 14), dtype=np.float64)
-    zeros = np.zeros(kin.model.nv)
-    raw_max = 0.0
-    for i in range(actions_joint.shape[0]):
-        q = np.asarray(actions_joint[i, ARM_CHANNELS], dtype=np.float64)
-        tau = pin.rnea(kin.model, kin.data, q, zeros, zeros)  # g(q), order == ARM_JOINTS
-        raw_max = max(raw_max, float(np.max(np.abs(tau))))
-        out[i] = np.clip(tau * scale, -TAUFF_CLIP_NM, TAUFF_CLIP_NM)
-    log.info(f"gravity feedforward: scale={scale}, worst |raw tau|={raw_max:.1f} N·m, "
-             f"clipped to ±{TAUFF_CLIP_NM:.0f} N·m")
-    if raw_max * scale > TAUFF_CLIP_NM:
-        log.warning(f"gravity tau hit the ±{TAUFF_CLIP_NM:.0f} N·m clip — inspect the "
+    from eef_kinematics import TAUFF_CLIP_NM
+    out = np.stack([kin.gravity_torque(actions_joint[i, ARM_CHANNELS], scale)
+                    for i in range(actions_joint.shape[0])])
+    worst = float(np.max(np.abs(out)))
+    log.info(f"gravity feedforward: scale={scale}, worst |tau| sent = {worst:.1f} N·m "
+             f"(clipped at ±{TAUFF_CLIP_NM:.0f})")
+    if worst >= TAUFF_CLIP_NM:
+        log.warning(f"gravity tau reached the ±{TAUFF_CLIP_NM:.0f} N·m clip — inspect the "
                     f"episode/model before running on hardware")
     return out
 
