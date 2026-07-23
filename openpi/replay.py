@@ -29,6 +29,17 @@ arm/gripper controllers expect:
     [:, 0:14] absolute arm joint targets (rad), order == ARM_JOINTS
     [:, 14]   left gripper  (rad)        [:, 15] right gripper (rad)
 
+GRAVITY FEEDFORWARD (why replay used to sit low)
+------------------------------------------------
+xr_teleoperate drives the arm at collection time with a gravity-compensation
+feedforward torque (arm_ik's sol_tauff = rnea(model, q, 0, 0), sent as motor
+tau), so the demonstrated arm holds its commanded pose. Open-loop replay with
+tau=0 has only the finite-kp PD term to fight gravity, so the arm settles below
+the commanded pose (q_meas = q_cmd - tau_gravity/kp) and the replayed EEF Z reads
+low. This script recomputes that same g(q) torque per frame and feeds it via
+ArmController.set_arm_tauff, matching the collection dynamics. Scale/disable it
+with --tauff-scale.
+
 SAFETY NOTE: much of this data is from sim. On real hardware, replay a slow pass
 first (--speed 0.3) and keep a hand on the e-stop. The arm's per-tick velocity
 clamp + per-joint position limits still apply, but a sim / IK'd trajectory can
@@ -78,6 +89,10 @@ RIGHT_GRIPPER_CHANNEL = 15
 
 # IK residual (m) above which a converted EEF frame is loudly flagged.
 IK_WARN_M = 0.02
+# Safety clip on the gravity feedforward torque (N·m per arm joint). The G1 arm
+# static gravity torques sit well under this; the clip just guards against a bad
+# rnea result ever reaching the motors.
+TAUFF_CLIP_NM = 30.0
 
 ARM_JOINT_NAMES = [
     "L_pitch", "L_roll ", "L_yaw ", "L_elbow", "L_wrR ", "L_wrP ", "L_wrY ",
@@ -122,7 +137,7 @@ def load_episode(data_root: Path, episode: int) -> tuple:
     return actions, fps, task, is_eef
 
 
-def eef_to_joint(actions: np.ndarray, args) -> np.ndarray:
+def eef_to_joint(actions: np.ndarray, kin) -> np.ndarray:
     """Convert an EEF-space episode [N,16] to joint-space [N,16] via warm-started
     IK (openpi/eef_kinematics.py), solving the whole episode before any motion.
 
@@ -131,11 +146,6 @@ def eef_to_joint(actions: np.ndarray, args) -> np.ndarray:
     solution — keeping the redundant elbow DOF on one branch — and the grippers
     (14, 15) pass through untouched. The first solve is seeded from INIT_POSE_READY.
     """
-    from eef_kinematics import G1DualArmKinematics, DEFAULT_URDF, DEFAULT_ASSETS
-    urdf = args.urdf or DEFAULT_URDF
-    log.info(f"EEF dataset: loading G1 dual-arm model from {urdf} for FK/IK")
-    kin = G1DualArmKinematics(urdf, args.assets or DEFAULT_ASSETS)
-
     out = np.empty_like(actions)
     ik_q = np.asarray(INIT_POSE_READY, dtype=np.float64)
     ik_max_m = 0.0
@@ -159,6 +169,36 @@ def eef_to_joint(actions: np.ndarray, args) -> np.ndarray:
     return out
 
 
+def compute_gravity_tauff(actions_joint: np.ndarray, kin, scale: float) -> np.ndarray:
+    """Precompute the per-frame gravity-compensation feedforward torque [N,14].
+
+    For each frame's 14 joint targets, rnea(model, q, v=0, a=0) on the same
+    reduced arm model used for IK gives the static joint torque needed to hold
+    that pose against gravity — the g(q) term. This is exactly what
+    xr_teleoperate feeds as motor tau at collection time (arm_arm_ik's sol_tauff),
+    which is why the demonstration didn't sag; feeding it here makes replay match.
+
+    Solved up front (like the IK) so nothing runs pinocchio in the streaming hot
+    loop, and so the torque range is visible before the arm moves. Clipped to
+    ±TAUFF_CLIP_NM as a safety guard and scaled by `scale`.
+    """
+    import pinocchio as pin
+    out = np.empty((actions_joint.shape[0], 14), dtype=np.float64)
+    zeros = np.zeros(kin.model.nv)
+    raw_max = 0.0
+    for i in range(actions_joint.shape[0]):
+        q = np.asarray(actions_joint[i, ARM_CHANNELS], dtype=np.float64)
+        tau = pin.rnea(kin.model, kin.data, q, zeros, zeros)  # g(q), order == ARM_JOINTS
+        raw_max = max(raw_max, float(np.max(np.abs(tau))))
+        out[i] = np.clip(tau * scale, -TAUFF_CLIP_NM, TAUFF_CLIP_NM)
+    log.info(f"gravity feedforward: scale={scale}, worst |raw tau|={raw_max:.1f} N·m, "
+             f"clipped to ±{TAUFF_CLIP_NM:.0f} N·m")
+    if raw_max * scale > TAUFF_CLIP_NM:
+        log.warning(f"gravity tau hit the ±{TAUFF_CLIP_NM:.0f} N·m clip — inspect the "
+                    f"episode/model before running on hardware")
+    return out
+
+
 def log_episode_ranges(actions: np.ndarray) -> None:
     """Per-joint range sanity print for the whole (joint-space) episode."""
     arm = actions[:, ARM_CHANNELS]
@@ -172,18 +212,24 @@ def log_episode_ranges(actions: np.ndarray) -> None:
 
 # ---------- replay loop ----------
 
-def _run_replay(arm, grip, actions, fps, args) -> None:
+def _run_replay(arm, grip, actions, tauff, fps, args) -> None:
     """Ramp to the episode's first frame, then stream the rest at fps/speed.
 
     The recorded start pose differs from INIT_POSE_READY, so frame 0 is reached
     with a smooth move_to_pose ramp (arms) + move_to_targets (grippers) before
     open-loop streaming begins — otherwise the first set_arm_target would be a
     jump that the per-tick velocity clamp would only partially absorb.
+
+    `tauff` is either None (no gravity feedforward) or an [N,14] torque array; the
+    frame-0 torque is applied before the approach ramp so the arm is already
+    gravity-compensated when streaming starts, and it is zeroed again on return.
     """
     n = actions.shape[0] if args.max_frames <= 0 else min(args.max_frames, actions.shape[0])
     dt = 1.0 / (fps * args.speed)
 
     first = actions[0]
+    if tauff is not None:
+        arm.set_arm_tauff(tauff[0])
     log.info(f"Ramping to episode start over {args.approach_duration:.1f}s")
     arm.move_to_pose(first[ARM_CHANNELS], duration=args.approach_duration,
                      velocity_limit=args.velocity_limit)
@@ -204,6 +250,8 @@ def _run_replay(arm, grip, actions, fps, args) -> None:
 
         a = actions[i]
         arm.set_arm_target(a[ARM_CHANNELS])
+        if tauff is not None:
+            arm.set_arm_tauff(tauff[i])
         grip.set_targets(
             float(np.clip(a[LEFT_GRIPPER_CHANNEL], GRIPPER_MIN, GRIPPER_MAX)),
             float(np.clip(a[RIGHT_GRIPPER_CHANNEL], GRIPPER_MIN, GRIPPER_MAX)),
@@ -213,6 +261,10 @@ def _run_replay(arm, grip, actions, fps, args) -> None:
         if sleep > 0:
             time.sleep(sleep)
 
+    # Drop the feedforward torque before the caller ramps back to the ready pose,
+    # so the return move and cleanup run with the arm's default (tau=0) dynamics.
+    if tauff is not None:
+        arm.set_arm_tauff(np.zeros(14))
     log.info(f"Replay done: {n} frames in {time.time()-play_t0:.1f}s")
 
 
@@ -275,11 +327,31 @@ def run(args) -> None:
     log.info(f"Loaded episode {args.episode} (task={task!r}, "
              f"{'EEF' if is_eef else 'joint'} space) from {args.data_root} "
              f"| fps={fps:.0f}{' (override)' if args.fps > 0 else ''}")
-    # EEF episodes are IK'd to joint space up front — before DDS/motion — so a
-    # bad solve is caught (and logged) while the robot is untouched.
+
+    # The reduced arm model is needed for EEF->joint IK and/or the gravity
+    # feedforward. Build it once, up front, and reuse for both — anything that
+    # needs pinocchio happens here, before DDS/motion, so a bad model/solve is
+    # caught while the robot is untouched.
+    kin = None
+    if is_eef or args.tauff_scale > 0:
+        from eef_kinematics import G1DualArmKinematics, DEFAULT_URDF, DEFAULT_ASSETS
+        urdf = args.urdf or DEFAULT_URDF
+        log.info(f"Loading G1 dual-arm model from {urdf} (IK / gravity feedforward)")
+        kin = G1DualArmKinematics(urdf, args.assets or DEFAULT_ASSETS)
+
     if is_eef:
-        actions = eef_to_joint(actions, args)
+        actions = eef_to_joint(actions, kin)
     log_episode_ranges(actions)
+
+    # Gravity-compensation feedforward: matches how the demonstration was
+    # collected (xr_teleoperate feeds sol_tauff), so the arm holds the commanded
+    # pose instead of sagging below it — otherwise replayed EEF Z sits low.
+    tauff = None
+    if args.tauff_scale > 0:
+        tauff = compute_gravity_tauff(actions, kin, args.tauff_scale)
+    else:
+        log.warning("gravity feedforward OFF (--tauff-scale 0): the arm will sag "
+                    "below the commanded pose and replayed Z will read low")
 
     log.info(f"Initializing DDS on {args.iface}")
     ChannelFactoryInitialize(0, args.iface)
@@ -294,7 +366,7 @@ def run(args) -> None:
         _wait_for_operator(args)
         log.info(f"Switching arm kp to replay value: {args.replay_kp_arm}")
         arm.set_arm_kp(args.replay_kp_arm)
-        _run_replay(arm, grip, actions, fps, args)
+        _run_replay(arm, grip, actions, tauff, fps, args)
         log.info("Returning arms to ready pose")
         _initialize_pose(arm, grip, args)
     finally:
@@ -316,11 +388,16 @@ def main() -> None:
                    help="Stop after this many frames; 0 = whole episode.")
     p.add_argument("--approach-duration", type=float, default=3.0,
                    help="Seconds to ramp from the ready pose to the episode's first frame.")
-    # ---- EEF datasets only (openpi/eef_kinematics.py) ----
+    # ---- Kinematics: EEF->joint IK + gravity feedforward (eef_kinematics.py) ----
     p.add_argument("--urdf", default=None,
-                   help="G1 URDF for EEF->joint IK (defaults to the packaged model)")
+                   help="G1 URDF for IK / gravity feedforward (defaults to the packaged model)")
     p.add_argument("--assets", default=None,
-                   help="Mesh assets dir for EEF->joint IK (defaults to the packaged dir)")
+                   help="Mesh assets dir for IK / gravity feedforward (defaults to the packaged dir)")
+    p.add_argument("--tauff-scale", type=float, default=1.0,
+                   help="Scale on the gravity-compensation feedforward torque fed to the "
+                        "arm (default 1.0 = full comp, matching collection). Use <1 (e.g. "
+                        "0.5) for a cautious first hardware pass, or 0 to disable (the arm "
+                        "will then sag and replayed Z reads low). Requires pinocchio.")
     # ---- Safety / motion limits (same defaults as openpi/main.py) ----
     p.add_argument("--velocity-limit", type=float, default=8.0,
                    help="rad/s velocity cap on the per-tick motion clamp (default 8.0)")

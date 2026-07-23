@@ -152,6 +152,11 @@ class ArmController:
 
         self._target_lock = threading.Lock()
         self._q_target = None  # set on first state update
+        # Optional per-joint feedforward torque (N·m), applied on the wire in
+        # addition to the PD term. Defaults to zeros -> tau=0.0 on every frame,
+        # i.e. identical behaviour to before. Only replay's gravity-compensation
+        # sets it; the inference paths leave it at zero.
+        self._tauff = np.zeros(14, dtype=np.float64)
 
         # Guards every read/write of self.cmd (+ CRC + Write) so the publish
         # thread, set_arm_kp, and disable_arm_sdk never race on the shared
@@ -216,6 +221,19 @@ class ArmController:
         clipped = np.clip(q_target, ARM_JOINT_MIN, ARM_JOINT_MAX)
         with self._target_lock:
             self._q_target = clipped.astype(np.float64).copy()
+
+    def set_arm_tauff(self, tauff: np.ndarray):
+        """Set the 14-DoF arm feedforward torque (N·m). Thread-safe.
+
+        Added to the PD output on the wire (motor_cmd[j].tau). Used to feed a
+        gravity-compensation torque so the arm holds the commanded pose instead
+        of sagging below it under a finite kp — matching how xr_teleoperate
+        drives the arm at collection time (rt/arm control with sol_tauff). Left
+        at zero by every other caller."""
+        if tauff.shape != (14,):
+            raise ValueError(f"Expected shape (14,), got {tauff.shape}")
+        with self._target_lock:
+            self._tauff = np.asarray(tauff, dtype=np.float64).copy()
 
     def set_velocity_limit(self, vlim: float):
         """Update the per-tick velocity clamp at runtime.
@@ -376,6 +394,7 @@ class ArmController:
 
                 with self._target_lock:
                     q_target = self._q_target.copy()
+                    tauff = self._tauff.copy()
 
                 q_current = self.get_arm_q()
                 q_cmd = self._clip_target(q_target, q_current)
@@ -387,7 +406,7 @@ class ArmController:
                     for idx, j in enumerate(ARM_JOINTS):
                         self.cmd.motor_cmd[j].q = float(q_cmd[idx])
                         self.cmd.motor_cmd[j].dq = 0.0
-                        self.cmd.motor_cmd[j].tau = 0.0
+                        self.cmd.motor_cmd[j].tau = float(tauff[idx])
                     self.cmd.crc = self.crc.Crc(self.cmd)
                     self.pub.Write(self.cmd)
 
