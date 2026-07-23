@@ -201,7 +201,7 @@ def _infer_worker(policy: FastWAMPolicy, obs: dict, box: dict) -> None:
         box["err"] = e
 
 
-def _run_inference_loop(arm, grip, cam, policy, args) -> None:
+def _run_inference_loop(arm, grip, cam, policy, kin, args) -> None:
     """Receding-horizon loop with one-chunk prefetch + boundary smoothing.
 
     Identical in structure to main_openpi.py / main-dit.py: execute the current
@@ -216,6 +216,12 @@ def _run_inference_loop(arm, grip, cam, policy, args) -> None:
     """
     dt = 1.0 / args.control_hz
     prompt = args.prompt
+    if args.tauff_scale > 0:
+        log.info(f"gravity feedforward ON (--tauff-scale {args.tauff_scale}): the arm "
+                 f"holds commanded poses against gravity, matching collection dynamics")
+    else:
+        log.warning("gravity feedforward OFF (--tauff-scale 0): the arm will sag below "
+                    "commanded poses — state feedback drifts out of the training distribution")
 
     # First chunk is a blocking infer (nothing to overlap it against yet).
     log.info(f"First inference (prompt={prompt!r}) — FastWAM warm-up may be slow")
@@ -256,6 +262,11 @@ def _run_inference_loop(arm, grip, cam, policy, args) -> None:
                 alpha = (i + 1) / (args.blend_steps + 1)
                 a = (1.0 - alpha) * last_cmd + alpha * a
             arm.set_arm_target(a[ARM_CHANNELS])
+            # Gravity feedforward: hold the commanded pose instead of sagging
+            # under kp — matches the collection-time dynamics (tau=sol_tauff) the
+            # policy was trained on, so state feedback stays in-distribution.
+            if args.tauff_scale > 0:
+                arm.set_arm_tauff(kin.gravity_torque(a[ARM_CHANNELS], args.tauff_scale))
             grip.set_targets(
                 float(np.clip(a[LEFT_GRIPPER_CHANNEL], GRIPPER_MIN, GRIPPER_MAX)),
                 float(np.clip(a[RIGHT_GRIPPER_CHANNEL], GRIPPER_MIN, GRIPPER_MAX)),
@@ -294,6 +305,10 @@ def _run_inference_loop(arm, grip, cam, policy, args) -> None:
         actions = next_actions
         start_idx = min(pending_skip, next_actions.shape[0] - 1)
 
+    # Drop the feedforward before run() ramps back to the ready pose, so that
+    # move runs with the arm's default (tau=0) dynamics.
+    if args.tauff_scale > 0:
+        arm.set_arm_tauff(np.zeros(14))
     _summarize_timing(infer_recs, chunk_recs, args)
 
 
@@ -360,6 +375,18 @@ def _cleanup(arm, grip, cam, policy) -> None:
 
 
 def run(args) -> None:
+    # Gravity feedforward uses the reduced-arm model from the openpi folder
+    # (eef_kinematics.py — pinocchio + numpy only, resolves its own asset paths).
+    # Build it before any DDS/robot state so a bad URDF fails while untouched.
+    kin = None
+    if args.tauff_scale > 0:
+        sys.path.insert(0, os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "openpi"))
+        from eef_kinematics import G1DualArmKinematics, DEFAULT_URDF, DEFAULT_ASSETS
+        urdf = args.urdf or DEFAULT_URDF
+        log.info(f"Loading G1 dual-arm model from {urdf} (gravity feedforward)")
+        kin = G1DualArmKinematics(urdf, args.assets or DEFAULT_ASSETS)
+
     log.info(f"Initializing DDS on {args.iface}")
     ChannelFactoryInitialize(0, args.iface)
 
@@ -379,7 +406,7 @@ def run(args) -> None:
         # Connect after Enter (PolicyClient waits for the server if it isn't up yet,
         # holding the arms at INIT_POSE_READY meanwhile — same as the openpi path).
         policy = FastWAMPolicy(host=args.server_host, port=args.server_port)
-        _run_inference_loop(arm, grip, cam, policy, args)
+        _run_inference_loop(arm, grip, cam, policy, kin, args)
         _initialize_pose(arm, grip, args)
     finally:
         _cleanup(arm, grip, cam, policy)
@@ -408,6 +435,17 @@ def main() -> None:
                         "commanded pose so a chunk swap ramps in smoothly (0 disables)")
     p.add_argument("--no-chunk-align", action="store_false", dest="chunk_align",
                    help="Disable chunk time-alignment (execute every chunk from index 0).")
+    # ---- Gravity feedforward (reduced-arm model from openpi/eef_kinematics.py) ----
+    p.add_argument("--tauff-scale", type=float, default=1.0,
+                   help="Scale on the gravity-compensation feedforward torque fed to the "
+                        "arm each step (default 1.0 = full comp, matching how the data was "
+                        "collected). Use <1 (e.g. 0.5) for a cautious first pass, or 0 to "
+                        "disable (the arm then sags and state feedback drifts OOD). Loads "
+                        "pinocchio from the openpi folder.")
+    p.add_argument("--urdf", default=None,
+                   help="G1 URDF for the gravity feedforward model (defaults to the packaged model)")
+    p.add_argument("--assets", default=None,
+                   help="Mesh assets dir for the gravity feedforward model (defaults to the packaged dir)")
     # ---- Safety / motion limits (same as main_openpi.py / main-dit.py) ----
     p.add_argument("--velocity-limit", type=float, default=8.0,
                    help="rad/s velocity cap on the per-tick motion clamp (default 8.0)")
