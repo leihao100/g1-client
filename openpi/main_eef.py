@@ -52,9 +52,12 @@ Usage (run from the repo root):
 import argparse
 import logging
 import os
+import select
 import sys
+import termios
 import threading
 import time
+import tty
 
 import cv2
 import numpy as np
@@ -252,6 +255,48 @@ def _summarize_timing(infer_recs, chunk_recs, args):
     log.info("=" * 64)
 
 
+class _KeyPoller:
+    """Non-blocking single-key reader on a POSIX terminal.
+
+    Puts stdin in cbreak mode so keypresses arrive without Enter. `poll()` returns
+    the pending key char (or None) without blocking; `wait_enter()` blocks until
+    Enter. Restores terminal settings on exit. If stdin is not a tty (e.g. piped),
+    it degrades to a no-op poll and a plain input() wait.
+    """
+
+    def __init__(self):
+        self._tty = sys.stdin.isatty()
+        self._fd = sys.stdin.fileno() if self._tty else None
+        self._old = None
+
+    def __enter__(self):
+        if self._tty:
+            self._old = termios.tcgetattr(self._fd)
+            tty.setcbreak(self._fd)
+        return self
+
+    def __exit__(self, *exc):
+        if self._tty and self._old is not None:
+            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old)
+
+    def poll(self):
+        if not self._tty:
+            return None
+        if select.select([sys.stdin], [], [], 0)[0]:
+            return sys.stdin.read(1)
+        return None
+
+    def wait_enter(self):
+        if not self._tty:
+            try:
+                input("")
+            except EOFError:
+                pass
+            return
+        while sys.stdin.read(1) not in ("\n", "\r"):
+            pass
+
+
 def _infer_worker(policy: PolicyClient, obs: dict, box: dict) -> None:
     """Run one blocking infer on a daemon thread; stash result/exception/timing.
 
@@ -293,110 +338,140 @@ def _run_inference_loop(arm, grip, cam, policy, kin, args) -> None:
         log.warning("gravity feedforward OFF (--tauff-scale 0): the arm will sag below "
                     "commanded poses — state feedback drifts out of the training distribution")
 
-    # First chunk is a blocking infer (nothing to overlap it against yet).
-    log.info(f"First inference (prompt={prompt!r})")
-    result = policy.infer(build_obs(cam, arm, grip, kin, prompt, args.send_jpeg))
-    actions = np.asarray(result["actions"], dtype=np.float64)
-    if actions.ndim != 2 or actions.shape[1] < 16:
-        raise RuntimeError(f"Unexpected action shape {actions.shape} (want [H, 16])")
     if args.raisez:
         log.info(f"--raisez {args.raisez:.1f} mm: offsetting every EEF Z target by "
                  f"{args.raisez*1e-3:+.4f} m (pelvis frame)")
-    actions = apply_raisez(actions, args.raisez)
-    log_chunk_ranges(0, actions)
 
-    infer_recs = [_timing_rec(dict(policy.last_timing or {}), _extract_server_ms(result))]
+    infer_recs = []
     chunk_recs = []
 
-    # Boundary-smoothing state, persisted across chunks:
-    #   start_idx — where to begin in the freshly received chunk (time-alignment)
-    #   last_cmd  — last 16-vec actually commanded (JOINT space), for the ramp-in
-    #   ik_q      — warm start for the next IK solve (continuity of the elbow DOF)
-    start_idx = 0
-    last_cmd = None
-    ik_q = np.asarray(arm.get_arm_q(), dtype=np.float64)
-    for c in range(1, args.max_chunks + 1):
-        H = actions.shape[0]
-        end_idx = H if args.exec_steps <= 0 else min(start_idx + args.exec_steps, H)
-        n = end_idx - start_idx
-        if n <= 0:
-            raise RuntimeError(
-                f"chunk {c}: nothing left to execute (start_idx={start_idx}, "
-                f"horizon={H}) — --prefetch-lead too large for this horizon")
-        lead = min(args.prefetch_lead, n)
-        box: dict = {}
-        th = None
-        pending_skip = 0
-        ik_max_m = 0.0
+    # Outer loop so pressing 'r' mid-run can ramp back to the ready pose, wait for
+    # Enter, and start a fresh inference session from the top.
+    with _KeyPoller() as keys:
+        log.info("Press [r] at any time to reset to the ready pose and re-arm.")
+        while True:
+            # First chunk is a blocking infer (nothing to overlap it against yet).
+            log.info(f"First inference (prompt={prompt!r})")
+            result = policy.infer(build_obs(cam, arm, grip, kin, prompt, args.send_jpeg))
+            actions = np.asarray(result["actions"], dtype=np.float64)
+            if actions.ndim != 2 or actions.shape[1] < 16:
+                raise RuntimeError(f"Unexpected action shape {actions.shape} (want [H, 16])")
+            actions = apply_raisez(actions, args.raisez)
+            log_chunk_ranges(0, actions)
+            infer_recs.append(_timing_rec(dict(policy.last_timing or {}), _extract_server_ms(result)))
 
-        exec_t0 = time.time()
-        for i in range(n):
-            if arm.faulted():
-                raise RuntimeError("ArmController control thread faulted — aborting")
-            tic = time.time()
+            # Boundary-smoothing state, persisted across chunks:
+            #   start_idx — where to begin in the freshly received chunk (time-alignment)
+            #   last_cmd  — last 16-vec actually commanded (JOINT space), for the ramp-in
+            #   ik_q      — warm start for the next IK solve (continuity of the elbow DOF)
+            start_idx = 0
+            last_cmd = None
+            ik_q = np.asarray(arm.get_arm_q(), dtype=np.float64)
+            reset_requested = False
+            for c in range(1, args.max_chunks + 1):
+                H = actions.shape[0]
+                end_idx = H if args.exec_steps <= 0 else min(start_idx + args.exec_steps, H)
+                n = end_idx - start_idx
+                if n <= 0:
+                    raise RuntimeError(
+                        f"chunk {c}: nothing left to execute (start_idx={start_idx}, "
+                        f"horizon={H}) — --prefetch-lead too large for this horizon")
+                lead = min(args.prefetch_lead, n)
+                box: dict = {}
+                th = None
+                pending_skip = 0
+                ik_max_m = 0.0
 
-            a_eef = actions[start_idx + i]
-            # EEF -> joints. Warm start from the previous solution so the
-            # redundant elbow DOF stays on one branch across the whole run.
-            ik_q, pos_err = kin.solve_ik(a_eef[LEFT_EEF_CHANNELS], a_eef[RIGHT_EEF_CHANNELS], ik_q)
-            ik_max_m = max(ik_max_m, pos_err)
-            if pos_err > IK_WARN_M:
-                log.warning(f"[chunk {c} step {i}] IK residual {pos_err*1e3:.1f} mm — "
-                            f"model predicted a barely-reachable EEF pose")
-            a = np.concatenate([ik_q, a_eef[[LEFT_GRIPPER_CHANNEL, RIGHT_GRIPPER_CHANNEL]]])
-            # Cross-fade the first --blend-steps from the last commanded pose
-            # into the new chunk so a swap ramps in instead of snapping.
-            if last_cmd is not None and i < args.blend_steps:
-                alpha = (i + 1) / (args.blend_steps + 1)
-                a = (1.0 - alpha) * last_cmd + alpha * a
-            arm.set_arm_target(a[:14])
-            # Gravity feedforward: hold the commanded pose instead of sagging
-            # under kp — matches the collection-time dynamics (tau=sol_tauff) the
-            # policy was trained on, so state feedback stays in-distribution.
+                exec_t0 = time.time()
+                for i in range(n):
+                    if arm.faulted():
+                        raise RuntimeError("ArmController control thread faulted — aborting")
+                    if keys.poll() == "r":
+                        reset_requested = True
+                        break
+                    tic = time.time()
+
+                    a_eef = actions[start_idx + i]
+                    # EEF -> joints. Warm start from the previous solution so the
+                    # redundant elbow DOF stays on one branch across the whole run.
+                    ik_q, pos_err = kin.solve_ik(a_eef[LEFT_EEF_CHANNELS], a_eef[RIGHT_EEF_CHANNELS], ik_q)
+                    ik_max_m = max(ik_max_m, pos_err)
+                    if pos_err > IK_WARN_M:
+                        log.warning(f"[chunk {c} step {i}] IK residual {pos_err*1e3:.1f} mm — "
+                                    f"model predicted a barely-reachable EEF pose")
+                    a = np.concatenate([ik_q, a_eef[[LEFT_GRIPPER_CHANNEL, RIGHT_GRIPPER_CHANNEL]]])
+                    # Cross-fade the first --blend-steps from the last commanded pose
+                    # into the new chunk so a swap ramps in instead of snapping.
+                    if last_cmd is not None and i < args.blend_steps:
+                        alpha = (i + 1) / (args.blend_steps + 1)
+                        a = (1.0 - alpha) * last_cmd + alpha * a
+                    arm.set_arm_target(a[:14])
+                    # Gravity feedforward: hold the commanded pose instead of sagging
+                    # under kp — matches the collection-time dynamics (tau=sol_tauff) the
+                    # policy was trained on, so state feedback stays in-distribution.
+                    if args.tauff_scale > 0:
+                        arm.set_arm_tauff(kin.gravity_torque(a[:14], args.tauff_scale))
+                    grip.set_targets(
+                        float(np.clip(a[LEFT_GRIPPER_CHANNEL], GRIPPER_MIN, GRIPPER_MAX)),
+                        float(np.clip(a[RIGHT_GRIPPER_CHANNEL], GRIPPER_MIN, GRIPPER_MAX)),
+                    )
+                    last_cmd = a
+
+                    # Fire the next-chunk request once `lead` steps remain (see main.py).
+                    if th is None and (n - i) <= lead:
+                        obs_next = build_obs(cam, arm, grip, kin, prompt, args.send_jpeg)
+                        pending_skip = (n - 1 - i) if args.chunk_align else 0
+                        th = threading.Thread(target=_infer_worker,
+                                              args=(policy, obs_next, box),
+                                              daemon=True, name=f"prefetch-{c}")
+                        th.start()
+
+                    sleep = dt - (time.time() - tic)
+                    if sleep > 0:
+                        time.sleep(sleep)
+
+                if reset_requested:
+                    # A prefetch may be in flight — join it before we reuse the
+                    # policy socket, or two threads would talk on it at once.
+                    if th is not None:
+                        th.join()
+                    break
+
+                # Collect the prefetched next chunk (it should be done or nearly).
+                exec_s = time.time() - exec_t0
+                join_t0 = time.time()
+                if th is not None:
+                    th.join()
+                join_wait_s = time.time() - join_t0
+                if "err" in box:
+                    raise box["err"]
+                next_actions = apply_raisez(box["actions"], args.raisez)
+
+                rec = _timing_rec(box.get("timing", {}), box.get("server_ms"))
+                infer_recs.append(rec)
+                chunk_recs.append({"exec_s": exec_s, "join_wait_s": join_wait_s, "ik_max_m": ik_max_m})
+                log.info(f"[chunk {c}] execute={exec_s:.2f}s join_wait={join_wait_s*1e3:.0f}ms "
+                         f"ik_max={ik_max_m*1e3:.2f}mm | "
+                         f"infer wall={rec['wall_ms']:.0f}ms pack={rec['pack_ms']:.0f} "
+                         f"send={rec['send_ms']:.0f} wait_recv={rec['wait_recv_ms']:.0f} "
+                         f"unpack={rec['unpack_ms']:.0f}"
+                         + (f" server={rec['server_ms']:.0f}" if rec['server_ms'] is not None else "")
+                         + (f" up={rec['bytes_sent']/1024:.0f}KiB" if rec['bytes_sent'] > 0 else ""))
+                log_chunk_ranges(c, next_actions)
+                actions = next_actions
+                start_idx = min(pending_skip, next_actions.shape[0] - 1)
+
+            if not reset_requested:
+                break  # ran to --max-chunks — done
+
+            # 'r' pressed: drop feedforward, ramp back to the ready pose, and wait
+            # for Enter before starting a fresh inference session from the top.
+            log.info("[r] reset requested — returning to ready pose")
             if args.tauff_scale > 0:
-                arm.set_arm_tauff(kin.gravity_torque(a[:14], args.tauff_scale))
-            grip.set_targets(
-                float(np.clip(a[LEFT_GRIPPER_CHANNEL], GRIPPER_MIN, GRIPPER_MAX)),
-                float(np.clip(a[RIGHT_GRIPPER_CHANNEL], GRIPPER_MIN, GRIPPER_MAX)),
-            )
-            last_cmd = a
-
-            # Fire the next-chunk request once `lead` steps remain (see main.py).
-            if th is None and (n - i) <= lead:
-                obs_next = build_obs(cam, arm, grip, kin, prompt, args.send_jpeg)
-                pending_skip = (n - 1 - i) if args.chunk_align else 0
-                th = threading.Thread(target=_infer_worker,
-                                      args=(policy, obs_next, box),
-                                      daemon=True, name=f"prefetch-{c}")
-                th.start()
-
-            sleep = dt - (time.time() - tic)
-            if sleep > 0:
-                time.sleep(sleep)
-
-        # Collect the prefetched next chunk (it should be done or nearly).
-        exec_s = time.time() - exec_t0
-        join_t0 = time.time()
-        if th is not None:
-            th.join()
-        join_wait_s = time.time() - join_t0
-        if "err" in box:
-            raise box["err"]
-        next_actions = apply_raisez(box["actions"], args.raisez)
-
-        rec = _timing_rec(box.get("timing", {}), box.get("server_ms"))
-        infer_recs.append(rec)
-        chunk_recs.append({"exec_s": exec_s, "join_wait_s": join_wait_s, "ik_max_m": ik_max_m})
-        log.info(f"[chunk {c}] execute={exec_s:.2f}s join_wait={join_wait_s*1e3:.0f}ms "
-                 f"ik_max={ik_max_m*1e3:.2f}mm | "
-                 f"infer wall={rec['wall_ms']:.0f}ms pack={rec['pack_ms']:.0f} "
-                 f"send={rec['send_ms']:.0f} wait_recv={rec['wait_recv_ms']:.0f} "
-                 f"unpack={rec['unpack_ms']:.0f}"
-                 + (f" server={rec['server_ms']:.0f}" if rec['server_ms'] is not None else "")
-                 + (f" up={rec['bytes_sent']/1024:.0f}KiB" if rec['bytes_sent'] > 0 else ""))
-        log_chunk_ranges(c, next_actions)
-        actions = next_actions
-        start_idx = min(pending_skip, next_actions.shape[0] - 1)
+                arm.set_arm_tauff(np.zeros(14))
+            _initialize_pose(arm, grip, args)
+            log.info("Press [Enter] to resume inference, or [Ctrl+C] to abort.")
+            keys.wait_enter()
 
     # Drop the feedforward before run() ramps back to the ready pose, so that
     # move runs with the arm's default (tau=0) dynamics.
