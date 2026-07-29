@@ -1,12 +1,30 @@
-"""Masked / weighted-blend inference loop for the G1 against a standard openpi
-serve_policy.py server (32-action-horizon checkpoint).
+"""Masked / weighted-blend inference loop for the G1 against an EEF-space openpi
+serve_policy.py server (pi05_g1_eef checkpoint) — joint-space-merge variant.
 
-WHAT CHANGED vs main_openpi.py
-------------------------------
-Nothing in the robot control path. arm_controller.py, gripper_controller.py and
-camera_client.py are used verbatim, and build_obs / the init / cleanup / standby
-sequence are imported unchanged from main_openpi.py. The ONLY new thing is the
-chunk-scheduling + blending policy in `_run_masked_loop`.
+WHAT CHANGED vs openpi/main_eef.py
+----------------------------------
+Same EEF observation/action contract, gravity feedforward, and safety sequence
+as main_eef.py — reused verbatim (build_obs, apply_raisez, log_chunk_ranges, the
+EEF channel layout, _initialize_pose / _wait_for_operator / _cleanup). The ONLY
+new thing is the chunk-scheduling + blending policy in `_run_masked_loop`:
+instead of executing a whole chunk then swapping, it commands `lead + wait`
+steps per cycle and weighted-merges the freshly received chunk into the plan.
+
+WHY THE MERGE IS IN JOINT SPACE
+-------------------------------
+Each EEF chunk is IK-solved to 14 joint targets *as soon as it arrives* (batch,
+on the prefetch daemon thread so the IK overlaps the current window), and the
+plan is stored in JOINT space. The weighted overlap merge (_merge_chunks) then
+blends joints linearly — NOT EEF poses. Blending the EEF quaternions linearly
+across a chunk swap would cut corners through SO(3); joint-space blending has no
+such problem. This mirrors main_eef.py's per-step "blend after IK" rationale.
+
+THREAD SAFETY
+-------------
+pinocchio's Data is not thread-safe, so the worker's batch IK must not share a
+kinematics object with the main thread's FK (build_obs) + gravity_torque. run()
+builds TWO G1DualArmKinematics: `kin` for the main thread, `kin_ik` for the
+worker. Each is only ever touched by one thread.
 
 THE SCHEDULE (for a horizon-32 model)
 -------------------------------------
@@ -14,8 +32,8 @@ A single merge cycle is `lead + wait` control steps (7 + 7 = 14 by default):
 
     command 7 steps from the current plan
       -> snapshot an obs and fire the next inference on a daemon thread
-    command 7 more steps  (inference runs hidden behind this window)
-      -> join the inference: a fresh 32-step chunk arrives
+    command 7 more steps  (inference + batch IK run hidden behind this window)
+      -> join: a fresh 32-step chunk arrives, already IK'd to joint space
       -> MERGE it into the plan, repeat
 
 TIME ALIGNMENT
@@ -28,15 +46,18 @@ to a stale pose then forward again.
 
 THE WEIGHTED MERGE  (the "mask")
 --------------------------------
-`old_future[k]` and `new_aligned[k]` are two predictions for the SAME future
-timestep. We cross-fade them with a weight that ramps the old:new ratio from
-1:1 at the first overlapping step to 0:1 at the last:
+`old_future[k]` and `new_aligned[k]` are two joint predictions for the SAME
+future timestep. We cross-fade them with a weight that ramps the old:new ratio
+from 1:1 at the first overlapping step to 0:1 at the last:
 
     a_new(k) = 0.5 + 0.5 * k/(L-1)      # 0.5 -> 1.0 over the overlap
     plan[k]  = (1 - a_new)*old_future[k] + a_new*new_aligned[k]
 
 so the freshly predicted chunk eases in instead of snapping. Whatever of the new
 chunk extends past the old plan (the non-overlapping tail) is appended verbatim.
+
+Press 'r' at any time to ramp back to the ready pose and re-arm (wait for Enter
+before a fresh session).
 
 Usage (run from the repo root):
   python openpi/main_mask.py \\
@@ -67,17 +88,24 @@ from g1_client.gripper_controller import GripperController, GRIPPER_MIN, GRIPPER
 from g1_client.camera_client import CameraClient
 from g1_client.policy_client import PolicyClient
 
-# Reuse everything that is identical to the plain openpi client — controllers are
-# untouched, only the scheduling/blending policy below is new.
-from main import (
-    ARM_CHANNELS, LEFT_GRIPPER_CHANNEL, RIGHT_GRIPPER_CHANNEL,
-    build_obs, log_chunk_ranges, _infer_worker,
+from eef_kinematics import G1DualArmKinematics, DEFAULT_URDF, DEFAULT_ASSETS
+
+# Reuse everything that is identical to the EEF openpi client — controllers,
+# EEF<->obs assembly, EEF channel layout, and the init/cleanup/standby sequence
+# are untouched; only the scheduling/blending policy below is new.
+from main_eef import (
+    LEFT_EEF_CHANNELS, RIGHT_EEF_CHANNELS,
+    LEFT_GRIPPER_CHANNEL, RIGHT_GRIPPER_CHANNEL, IK_WARN_M,
+    build_obs, apply_raisez, log_chunk_ranges,
     _initialize_pose, _wait_for_operator, _cleanup,
 )
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("g1_openpi.mask")
+
+# The plan is stored in JOINT space after IK: [H, 16] = 14 joints + 2 grippers.
+ARM_JOINTS = slice(0, 14)
 
 
 # ---------- keyboard reset ----------
@@ -124,15 +152,61 @@ class _KeyPoller:
             pass
 
 
+# ---------- EEF chunk -> joint plan ----------
+
+def _ik_chunk(eef_actions: np.ndarray, kin: G1DualArmKinematics,
+              q_seed: np.ndarray):
+    """Batch-IK a [H, 16] EEF chunk into a [H, 16] joint plan (14 joints + 2 grip).
+
+    Each row is solved warm-started from the previous solution so the redundant
+    elbow DOF stays on one branch across the whole chunk. Returns
+    (joint_chunk, ik_max_m, last_q).
+    """
+    H = eef_actions.shape[0]
+    out = np.empty((H, 16), dtype=np.float64)
+    q = np.asarray(q_seed, dtype=np.float64)
+    ik_max = 0.0
+    for k in range(H):
+        a = eef_actions[k]
+        q, pos_err = kin.solve_ik(a[LEFT_EEF_CHANNELS], a[RIGHT_EEF_CHANNELS], q)
+        ik_max = max(ik_max, pos_err)
+        out[k, ARM_JOINTS] = q
+        out[k, LEFT_GRIPPER_CHANNEL] = a[LEFT_GRIPPER_CHANNEL]
+        out[k, RIGHT_GRIPPER_CHANNEL] = a[RIGHT_GRIPPER_CHANNEL]
+    return out, ik_max, q
+
+
+def _infer_ik_worker(policy: PolicyClient, obs: dict, kin_ik: G1DualArmKinematics,
+                     raisez: float, q_seed: np.ndarray, box: dict) -> None:
+    """Infer one EEF chunk and batch-IK it to a joint plan on this daemon thread
+    so both the network wait and the IK overlap the current execution window.
+
+    Uses its OWN kinematics instance (kin_ik) so it never touches the main
+    thread's kin (build_obs FK + gravity_torque) concurrently — pinocchio Data is
+    not thread-safe. Result/exception surfaced via `box`.
+    """
+    try:
+        result = policy.infer(obs)
+        eef = np.asarray(result["actions"], dtype=np.float64)
+        if eef.ndim != 2 or eef.shape[1] < 16:
+            raise RuntimeError(f"Unexpected action shape {eef.shape} (want [H, 16])")
+        eef = apply_raisez(eef, raisez)
+        joint, ik_max, _ = _ik_chunk(eef, kin_ik, q_seed)
+        box["eef"] = eef              # kept for EEF-range logging on the main thread
+        box["actions"] = joint        # the joint plan the merge consumes
+        box["ik_max_m"] = ik_max
+    except BaseException as e:  # surface to the main thread
+        box["err"] = e
+
+
 # ---------- the weighted overlap merge (the "mask") ----------
 
 def _merge_chunks(old_future: np.ndarray, new_aligned: np.ndarray) -> np.ndarray:
     """Weighted temporal blend of the old plan tail and the time-aligned new chunk.
 
-    old_future[k] and new_aligned[k] are two predictions for the same future
-    timestep. Over the overlap the old:new weight ramps 1:1 -> 0:1 (a_new
-    0.5 -> 1.0), so the new chunk fades in. The longer chunk's non-overlapping
-    tail is appended unblended.
+    Both are JOINT-space [., 16] predictions for the same future timesteps. Over
+    the overlap the old:new weight ramps 1:1 -> 0:1 (a_new 0.5 -> 1.0), so the new
+    chunk fades in. The longer chunk's non-overlapping tail is appended unblended.
 
     In this loop's cadence new_aligned is always >= old_future, so the appended
     tail is the new chunk's extra steps — but the old-extends-further branch is
@@ -153,17 +227,17 @@ def _merge_chunks(old_future: np.ndarray, new_aligned: np.ndarray) -> np.ndarray
 
 # ---------- inference loop ----------
 
-def _run_masked_loop(arm, grip, cam, policy, kin, args) -> None:
-    """Receding-horizon loop: command `lead` steps, prefetch, command `wait`
-    steps, then merge the prefetched chunk with a weighted overlap blend.
+def _run_masked_loop(arm, grip, cam, policy, kin, kin_ik, args) -> None:
+    """Receding-horizon loop: command `lead` steps, prefetch (infer + batch IK),
+    command `wait` steps, then merge the prefetched joint chunk with a weighted
+    overlap blend.
 
     The arm/gripper publish threads keep holding the last commanded target while
     `th.join()` blocks, so even if inference overruns the `wait` window the worst
     case is a brief hold, not an unsafe state.
 
-    Press 'r' at any time to ramp back to the ready pose and re-arm (wait for
-    Enter before a fresh session). Gravity feedforward holds each commanded pose
-    against gravity when --tauff-scale > 0.
+    Press 'r' at any time to ramp back to the ready pose and re-arm. Gravity
+    feedforward holds each commanded pose against gravity when --tauff-scale > 0.
     """
     dt = 1.0 / args.control_hz
     prompt = args.prompt
@@ -184,16 +258,24 @@ def _run_masked_loop(arm, grip, cam, policy, kin, args) -> None:
     with _KeyPoller() as keys:
         log.info("Press [r] at any time to reset to the ready pose and re-arm.")
         while True:
-            # First chunk is a blocking infer (nothing to overlap it against yet).
+            # First chunk is a blocking infer + IK (nothing to overlap yet).
             log.info(f"First inference (prompt={prompt!r})")
-            result = policy.infer(build_obs(cam, arm, grip, prompt, args.send_jpeg))
-            plan = np.asarray(result["actions"], dtype=np.float64)
-            if plan.ndim != 2 or plan.shape[1] < 16:
-                raise RuntimeError(f"Unexpected action shape {plan.shape} (want [H, 16])")
+            result = policy.infer(build_obs(cam, arm, grip, kin, prompt, args.send_jpeg))
+            eef = np.asarray(result["actions"], dtype=np.float64)
+            if eef.ndim != 2 or eef.shape[1] < 16:
+                raise RuntimeError(f"Unexpected action shape {eef.shape} (want [H, 16])")
+            if args.raisez:
+                log.info(f"--raisez {args.raisez:.1f} mm: offsetting every EEF Z target by "
+                         f"{args.raisez*1e-3:+.4f} m (pelvis frame)")
+            eef = apply_raisez(eef, args.raisez)
+            log_chunk_ranges(0, eef)
+            plan, ik_max, _ = _ik_chunk(eef, kin_ik, np.asarray(arm.get_arm_q(), dtype=np.float64))
+            if ik_max > IK_WARN_M:
+                log.warning(f"[chunk 0] IK residual {ik_max*1e3:.1f} mm — model predicted "
+                            f"a barely-reachable EEF pose")
             if plan.shape[0] <= skip + cycle:
                 raise RuntimeError(f"horizon {plan.shape[0]} too short for lead={lead} "
                                    f"wait={wait} (need > {skip + cycle})")
-            log_chunk_ranges(0, plan)
 
             ptr = 0              # index of the next step to command within `plan`
             since_merge = 0      # steps commanded since the last merge
@@ -217,12 +299,12 @@ def _run_masked_loop(arm, grip, cam, policy, kin, args) -> None:
                     tic = time.time()
 
                     a = plan[ptr]
-                    arm.set_arm_target(a[ARM_CHANNELS])
+                    arm.set_arm_target(a[ARM_JOINTS])
                     # Gravity feedforward: hold the commanded pose instead of sagging
                     # under kp — matches the collection-time dynamics (tau=sol_tauff) the
                     # policy was trained on, so state feedback stays in-distribution.
                     if args.tauff_scale > 0:
-                        arm.set_arm_tauff(kin.gravity_torque(a[ARM_CHANNELS], args.tauff_scale))
+                        arm.set_arm_tauff(kin.gravity_torque(a[ARM_JOINTS], args.tauff_scale))
                     grip.set_targets(
                         float(np.clip(a[LEFT_GRIPPER_CHANNEL], GRIPPER_MIN, GRIPPER_MAX)),
                         float(np.clip(a[RIGHT_GRIPPER_CHANNEL], GRIPPER_MIN, GRIPPER_MAX)),
@@ -230,13 +312,16 @@ def _run_masked_loop(arm, grip, cam, policy, kin, args) -> None:
                     ptr += 1
                     since_merge += 1
 
-                    # After `lead` steps, snapshot an obs and fire the next inference so
-                    # it overlaps the remaining `wait` steps of this window.
+                    # After `lead` steps, snapshot an obs and fire the next
+                    # inference+IK so it overlaps the remaining `wait` steps. The
+                    # worker warm-starts IK from the joints we just commanded.
                     if since_merge == lead and not prefetch_fired:
-                        obs_next = build_obs(cam, arm, grip, prompt, args.send_jpeg)
+                        obs_next = build_obs(cam, arm, grip, kin, prompt, args.send_jpeg)
                         box = {}
-                        th = threading.Thread(target=_infer_worker, args=(policy, obs_next, box),
-                                              daemon=True, name=f"prefetch-{merges}")
+                        th = threading.Thread(
+                            target=_infer_ik_worker,
+                            args=(policy, obs_next, kin_ik, args.raisez, a[ARM_JOINTS].copy(), box),
+                            daemon=True, name=f"prefetch-{merges}")
                         th.start()
                         prefetch_fired = True
 
@@ -251,16 +336,17 @@ def _run_masked_loop(arm, grip, cam, policy, kin, args) -> None:
                         th.join()
                     break
 
-                # Adopt the prefetched chunk and merge it into the plan.
+                # Adopt the prefetched joint chunk and merge it into the plan.
                 join_t0 = time.time()
                 th.join()
                 join_wait_ms = (time.time() - join_t0) * 1e3
                 if "err" in box:
                     raise box["err"]
-                new_chunk = box["actions"]            # [H, 16], new_chunk[0] ~ obs@(merge-wait)
+                new_chunk = box["actions"]            # joint [H, 16], row 0 ~ obs@(merge-wait)
                 new_aligned = new_chunk[skip:]        # drop the `wait` already-elapsed steps
                 old_future = plan[ptr:]               # what the old plan still has queued
                 plan = _merge_chunks(old_future, new_aligned)
+                ik_max = box["ik_max_m"]
                 ptr = 0
                 since_merge = 0
                 prefetch_fired = False
@@ -269,9 +355,13 @@ def _run_masked_loop(arm, grip, cam, policy, kin, args) -> None:
                 overlap = min(len(old_future), len(new_aligned))
                 appended = max(0, len(new_aligned) - len(old_future))
                 log.info(f"[merge {merges}] overlap={overlap} append={appended} "
-                         f"plan_len={len(plan)} join_wait={join_wait_ms:.0f}ms"
+                         f"plan_len={len(plan)} ik_max={ik_max*1e3:.2f}mm "
+                         f"join_wait={join_wait_ms:.0f}ms"
                          + (f" STALLED" if join_wait_ms > 1.0 else ""))
-                log_chunk_ranges(merges, plan)
+                if ik_max > IK_WARN_M:
+                    log.warning(f"[merge {merges}] IK residual {ik_max*1e3:.1f} mm — model "
+                                f"predicted a barely-reachable EEF pose")
+                log_chunk_ranges(merges, box["eef"])
 
             if not reset_requested:
                 break  # ran to --max-chunks — done
@@ -294,14 +384,12 @@ def _run_masked_loop(arm, grip, cam, policy, kin, args) -> None:
 # ---------- entry point ----------
 
 def run(args) -> None:
-    # Kinematics are only needed for the gravity feedforward; loaded lazily so
-    # the --tauff-scale 0 path keeps the zero-pinocchio dependency footprint.
-    kin = None
-    if args.tauff_scale > 0:
-        from eef_kinematics import G1DualArmKinematics, DEFAULT_URDF, DEFAULT_ASSETS
-        urdf = args.urdf or DEFAULT_URDF
-        log.info(f"Loading G1 dual-arm model from {urdf} (gravity feedforward)")
-        kin = G1DualArmKinematics(urdf, args.assets or DEFAULT_ASSETS)
+    # Two kinematics instances: `kin` for the main thread (build_obs FK + gravity
+    # tauff), `kin_ik` for the prefetch worker's batch IK. pinocchio Data is not
+    # thread-safe, so they must not be shared. A bad URDF fails here, before DDS.
+    log.info(f"Loading G1 dual-arm model from {args.urdf}")
+    kin = G1DualArmKinematics(args.urdf, args.assets)
+    kin_ik = G1DualArmKinematics(args.urdf, args.assets)
 
     log.info(f"Initializing DDS on {args.iface}")
     ChannelFactoryInitialize(0, args.iface)
@@ -320,7 +408,7 @@ def run(args) -> None:
         log.info(f"Switching arm kp to inference value: {args.inference_kp_arm}")
         arm.set_arm_kp(args.inference_kp_arm)
         policy = PolicyClient(host=args.server_host, port=args.server_port)
-        _run_masked_loop(arm, grip, cam, policy, kin, args)
+        _run_masked_loop(arm, grip, cam, policy, kin, kin_ik, args)
         _initialize_pose(arm, grip, args)
     finally:
         _cleanup(arm, grip, cam, policy)
@@ -334,10 +422,17 @@ def main() -> None:
     p.add_argument("--image-server", default="192.168.123.164",
                    help="G1 PC2 image-server host (default 192.168.123.164)")
     p.add_argument("--prompt", default="pick the red bottle")
+    p.add_argument("--urdf", default=DEFAULT_URDF,
+                   help="G1 URDF for FK/IK (must match the dataset conversion model)")
+    p.add_argument("--assets", default=DEFAULT_ASSETS,
+                   help="Directory with the URDF's mesh assets")
     p.add_argument("--send-jpeg", action="store_true",
                    help="Send compressed JPEG bytes instead of decoded RGB arrays "
                         "(~12x smaller upload). REQUIRES the server to imdecode + "
                         "BGR->RGB these image keys.")
+    p.add_argument("--raisez", type=float, default=0.0,
+                   help="Raise every returned EEF Z target by this many mm (pelvis "
+                        "frame, both arms) before IK. Positive = higher. Default 0 (off).")
     p.add_argument("--max-chunks", type=int, default=30,
                    help="How many merge cycles to run before stopping")
     p.add_argument("--control-hz", type=float, default=15.0,
@@ -357,13 +452,8 @@ def main() -> None:
                    help="Scale on the gravity-compensation feedforward torque fed to the "
                         "arm each step (default 1.0 = full comp, matching how the data was "
                         "collected). Use <1 (e.g. 0.5) for a cautious first pass, or 0 to "
-                        "disable (the arm then sags and state feedback drifts OOD). Loads "
-                        "pinocchio via eef_kinematics.py.")
-    p.add_argument("--urdf", default=None,
-                   help="G1 URDF for the gravity feedforward model (defaults to the packaged model)")
-    p.add_argument("--assets", default=None,
-                   help="Mesh assets dir for the gravity feedforward model (defaults to the packaged dir)")
-    # ---- Safety / motion limits (same as main_openpi.py) ----
+                        "disable (the arm then sags and state feedback drifts OOD).")
+    # ---- Safety / motion limits (same as main_eef.py) ----
     p.add_argument("--velocity-limit", type=float, default=8.0,
                    help="rad/s velocity cap on the per-tick motion clamp (default 8.0)")
     p.add_argument("--inference-kp-arm", type=float, default=80.0,
