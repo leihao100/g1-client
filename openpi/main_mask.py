@@ -49,9 +49,12 @@ Usage (run from the repo root):
 import argparse
 import logging
 import os
+import select
 import sys
+import termios
 import threading
 import time
+import tty
 
 import numpy as np
 
@@ -75,6 +78,50 @@ from main import (
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("g1_openpi.mask")
+
+
+# ---------- keyboard reset ----------
+
+class _KeyPoller:
+    """Non-blocking single-key reader on a POSIX terminal.
+
+    Puts stdin in cbreak mode so keypresses arrive without Enter. `poll()` returns
+    the pending key char (or None) without blocking; `wait_enter()` blocks until
+    Enter. Restores terminal settings on exit. If stdin is not a tty (e.g. piped),
+    it degrades to a no-op poll and a plain input() wait.
+    """
+
+    def __init__(self):
+        self._tty = sys.stdin.isatty()
+        self._fd = sys.stdin.fileno() if self._tty else None
+        self._old = None
+
+    def __enter__(self):
+        if self._tty:
+            self._old = termios.tcgetattr(self._fd)
+            tty.setcbreak(self._fd)
+        return self
+
+    def __exit__(self, *exc):
+        if self._tty and self._old is not None:
+            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old)
+
+    def poll(self):
+        if not self._tty:
+            return None
+        if select.select([sys.stdin], [], [], 0)[0]:
+            return sys.stdin.read(1)
+        return None
+
+    def wait_enter(self):
+        if not self._tty:
+            try:
+                input("")
+            except EOFError:
+                pass
+            return
+        while sys.stdin.read(1) not in ("\n", "\r"):
+            pass
 
 
 # ---------- the weighted overlap merge (the "mask") ----------
@@ -106,13 +153,17 @@ def _merge_chunks(old_future: np.ndarray, new_aligned: np.ndarray) -> np.ndarray
 
 # ---------- inference loop ----------
 
-def _run_masked_loop(arm, grip, cam, policy, args) -> None:
+def _run_masked_loop(arm, grip, cam, policy, kin, args) -> None:
     """Receding-horizon loop: command `lead` steps, prefetch, command `wait`
     steps, then merge the prefetched chunk with a weighted overlap blend.
 
     The arm/gripper publish threads keep holding the last commanded target while
     `th.join()` blocks, so even if inference overruns the `wait` window the worst
     case is a brief hold, not an unsafe state.
+
+    Press 'r' at any time to ramp back to the ready pose and re-arm (wait for
+    Enter before a fresh session). Gravity feedforward holds each commanded pose
+    against gravity when --tauff-scale > 0.
     """
     dt = 1.0 / args.control_hz
     prompt = args.prompt
@@ -123,84 +174,135 @@ def _run_masked_loop(arm, grip, cam, policy, args) -> None:
     if args.send_jpeg:
         log.warning("--send-jpeg ON: sending compressed JPEG bytes. The SERVER must "
                     "imdecode + cv2.COLOR_BGR2RGB these keys, or it sees garbage.")
+    if args.tauff_scale > 0:
+        log.info(f"gravity feedforward ON (--tauff-scale {args.tauff_scale}): the arm "
+                 f"holds commanded poses against gravity, matching collection dynamics")
+    else:
+        log.warning("gravity feedforward OFF (--tauff-scale 0): the arm will sag below "
+                    "commanded poses — state feedback drifts out of the training distribution")
 
-    # First chunk is a blocking infer (nothing to overlap it against yet).
-    log.info(f"First inference (prompt={prompt!r})")
-    result = policy.infer(build_obs(cam, arm, grip, prompt, args.send_jpeg))
-    plan = np.asarray(result["actions"], dtype=np.float64)
-    if plan.ndim != 2 or plan.shape[1] < 16:
-        raise RuntimeError(f"Unexpected action shape {plan.shape} (want [H, 16])")
-    if plan.shape[0] <= skip + cycle:
-        raise RuntimeError(f"horizon {plan.shape[0]} too short for lead={lead} "
-                           f"wait={wait} (need > {skip + cycle})")
-    log_chunk_ranges(0, plan)
+    with _KeyPoller() as keys:
+        log.info("Press [r] at any time to reset to the ready pose and re-arm.")
+        while True:
+            # First chunk is a blocking infer (nothing to overlap it against yet).
+            log.info(f"First inference (prompt={prompt!r})")
+            result = policy.infer(build_obs(cam, arm, grip, prompt, args.send_jpeg))
+            plan = np.asarray(result["actions"], dtype=np.float64)
+            if plan.ndim != 2 or plan.shape[1] < 16:
+                raise RuntimeError(f"Unexpected action shape {plan.shape} (want [H, 16])")
+            if plan.shape[0] <= skip + cycle:
+                raise RuntimeError(f"horizon {plan.shape[0]} too short for lead={lead} "
+                                   f"wait={wait} (need > {skip + cycle})")
+            log_chunk_ranges(0, plan)
 
-    ptr = 0              # index of the next step to command within `plan`
-    since_merge = 0      # steps commanded since the last merge
-    prefetch_fired = False
-    box: dict = {}
-    th = None
+            ptr = 0              # index of the next step to command within `plan`
+            since_merge = 0      # steps commanded since the last merge
+            prefetch_fired = False
+            box: dict = {}
+            th = None
+            reset_requested = False
 
-    for merges in range(1, args.max_chunks + 1):
-        # Command `cycle` steps from the current plan, firing the prefetch
-        # `wait` steps before the end of the window.
-        for _ in range(cycle):
-            if arm.faulted():
-                raise RuntimeError("ArmController control thread faulted — aborting")
-            if ptr >= len(plan):
-                raise RuntimeError(f"plan exhausted (ptr={ptr}, len={len(plan)}) — "
-                                   f"inference slower than {wait} steps")
-            tic = time.time()
+            for merges in range(1, args.max_chunks + 1):
+                # Command `cycle` steps from the current plan, firing the prefetch
+                # `wait` steps before the end of the window.
+                for _ in range(cycle):
+                    if arm.faulted():
+                        raise RuntimeError("ArmController control thread faulted — aborting")
+                    if keys.poll() == "r":
+                        reset_requested = True
+                        break
+                    if ptr >= len(plan):
+                        raise RuntimeError(f"plan exhausted (ptr={ptr}, len={len(plan)}) — "
+                                           f"inference slower than {wait} steps")
+                    tic = time.time()
 
-            a = plan[ptr]
-            arm.set_arm_target(a[ARM_CHANNELS])
-            grip.set_targets(
-                float(np.clip(a[LEFT_GRIPPER_CHANNEL], GRIPPER_MIN, GRIPPER_MAX)),
-                float(np.clip(a[RIGHT_GRIPPER_CHANNEL], GRIPPER_MIN, GRIPPER_MAX)),
-            )
-            ptr += 1
-            since_merge += 1
+                    a = plan[ptr]
+                    arm.set_arm_target(a[ARM_CHANNELS])
+                    # Gravity feedforward: hold the commanded pose instead of sagging
+                    # under kp — matches the collection-time dynamics (tau=sol_tauff) the
+                    # policy was trained on, so state feedback stays in-distribution.
+                    if args.tauff_scale > 0:
+                        arm.set_arm_tauff(kin.gravity_torque(a[ARM_CHANNELS], args.tauff_scale))
+                    grip.set_targets(
+                        float(np.clip(a[LEFT_GRIPPER_CHANNEL], GRIPPER_MIN, GRIPPER_MAX)),
+                        float(np.clip(a[RIGHT_GRIPPER_CHANNEL], GRIPPER_MIN, GRIPPER_MAX)),
+                    )
+                    ptr += 1
+                    since_merge += 1
 
-            # After `lead` steps, snapshot an obs and fire the next inference so
-            # it overlaps the remaining `wait` steps of this window.
-            if since_merge == lead and not prefetch_fired:
-                obs_next = build_obs(cam, arm, grip, prompt, args.send_jpeg)
-                box = {}
-                th = threading.Thread(target=_infer_worker, args=(policy, obs_next, box),
-                                      daemon=True, name=f"prefetch-{merges}")
-                th.start()
-                prefetch_fired = True
+                    # After `lead` steps, snapshot an obs and fire the next inference so
+                    # it overlaps the remaining `wait` steps of this window.
+                    if since_merge == lead and not prefetch_fired:
+                        obs_next = build_obs(cam, arm, grip, prompt, args.send_jpeg)
+                        box = {}
+                        th = threading.Thread(target=_infer_worker, args=(policy, obs_next, box),
+                                              daemon=True, name=f"prefetch-{merges}")
+                        th.start()
+                        prefetch_fired = True
 
-            sleep = dt - (time.time() - tic)
-            if sleep > 0:
-                time.sleep(sleep)
+                    sleep = dt - (time.time() - tic)
+                    if sleep > 0:
+                        time.sleep(sleep)
 
-        # Adopt the prefetched chunk and merge it into the plan.
-        join_t0 = time.time()
-        th.join()
-        join_wait_ms = (time.time() - join_t0) * 1e3
-        if "err" in box:
-            raise box["err"]
-        new_chunk = box["actions"]            # [H, 16], new_chunk[0] ~ obs@(merge-wait)
-        new_aligned = new_chunk[skip:]        # drop the `wait` already-elapsed steps
-        old_future = plan[ptr:]               # what the old plan still has queued
-        plan = _merge_chunks(old_future, new_aligned)
-        ptr = 0
-        since_merge = 0
-        prefetch_fired = False
-        th = None
+                if reset_requested:
+                    # A prefetch may be in flight — join it before we reuse the
+                    # policy socket, or two threads would talk on it at once.
+                    if th is not None:
+                        th.join()
+                    break
 
-        overlap = min(len(old_future), len(new_aligned))
-        appended = max(0, len(new_aligned) - len(old_future))
-        log.info(f"[merge {merges}] overlap={overlap} append={appended} "
-                 f"plan_len={len(plan)} join_wait={join_wait_ms:.0f}ms"
-                 + (f" STALLED" if join_wait_ms > 1.0 else ""))
-        log_chunk_ranges(merges, plan)
+                # Adopt the prefetched chunk and merge it into the plan.
+                join_t0 = time.time()
+                th.join()
+                join_wait_ms = (time.time() - join_t0) * 1e3
+                if "err" in box:
+                    raise box["err"]
+                new_chunk = box["actions"]            # [H, 16], new_chunk[0] ~ obs@(merge-wait)
+                new_aligned = new_chunk[skip:]        # drop the `wait` already-elapsed steps
+                old_future = plan[ptr:]               # what the old plan still has queued
+                plan = _merge_chunks(old_future, new_aligned)
+                ptr = 0
+                since_merge = 0
+                prefetch_fired = False
+                th = None
+
+                overlap = min(len(old_future), len(new_aligned))
+                appended = max(0, len(new_aligned) - len(old_future))
+                log.info(f"[merge {merges}] overlap={overlap} append={appended} "
+                         f"plan_len={len(plan)} join_wait={join_wait_ms:.0f}ms"
+                         + (f" STALLED" if join_wait_ms > 1.0 else ""))
+                log_chunk_ranges(merges, plan)
+
+            if not reset_requested:
+                break  # ran to --max-chunks — done
+
+            # 'r' pressed: drop feedforward, ramp back to the ready pose, and wait
+            # for Enter before starting a fresh inference session from the top.
+            log.info("[r] reset requested — returning to ready pose")
+            if args.tauff_scale > 0:
+                arm.set_arm_tauff(np.zeros(14))
+            _initialize_pose(arm, grip, args)
+            log.info("Press [Enter] to resume inference, or [Ctrl+C] to abort.")
+            keys.wait_enter()
+
+    # Drop the feedforward before run() ramps back to the ready pose, so that
+    # move runs with the arm's default (tau=0) dynamics.
+    if args.tauff_scale > 0:
+        arm.set_arm_tauff(np.zeros(14))
 
 
 # ---------- entry point ----------
 
 def run(args) -> None:
+    # Kinematics are only needed for the gravity feedforward; loaded lazily so
+    # the --tauff-scale 0 path keeps the zero-pinocchio dependency footprint.
+    kin = None
+    if args.tauff_scale > 0:
+        from eef_kinematics import G1DualArmKinematics, DEFAULT_URDF, DEFAULT_ASSETS
+        urdf = args.urdf or DEFAULT_URDF
+        log.info(f"Loading G1 dual-arm model from {urdf} (gravity feedforward)")
+        kin = G1DualArmKinematics(urdf, args.assets or DEFAULT_ASSETS)
+
     log.info(f"Initializing DDS on {args.iface}")
     ChannelFactoryInitialize(0, args.iface)
 
@@ -218,7 +320,7 @@ def run(args) -> None:
         log.info(f"Switching arm kp to inference value: {args.inference_kp_arm}")
         arm.set_arm_kp(args.inference_kp_arm)
         policy = PolicyClient(host=args.server_host, port=args.server_port)
-        _run_masked_loop(arm, grip, cam, policy, args)
+        _run_masked_loop(arm, grip, cam, policy, kin, args)
         _initialize_pose(arm, grip, args)
     finally:
         _cleanup(arm, grip, cam, policy)
@@ -250,6 +352,17 @@ def main() -> None:
                    help="Do not drop the new chunk's leading `infer_wait` steps. By "
                         "default they are dropped so the new chunk is wall-clock "
                         "aligned with the plan it replaces; pass this for A/B testing.")
+    # ---- Gravity feedforward (reduced-arm model from eef_kinematics.py) ----
+    p.add_argument("--tauff-scale", type=float, default=1.0,
+                   help="Scale on the gravity-compensation feedforward torque fed to the "
+                        "arm each step (default 1.0 = full comp, matching how the data was "
+                        "collected). Use <1 (e.g. 0.5) for a cautious first pass, or 0 to "
+                        "disable (the arm then sags and state feedback drifts OOD). Loads "
+                        "pinocchio via eef_kinematics.py.")
+    p.add_argument("--urdf", default=None,
+                   help="G1 URDF for the gravity feedforward model (defaults to the packaged model)")
+    p.add_argument("--assets", default=None,
+                   help="Mesh assets dir for the gravity feedforward model (defaults to the packaged dir)")
     # ---- Safety / motion limits (same as main_openpi.py) ----
     p.add_argument("--velocity-limit", type=float, default=8.0,
                    help="rad/s velocity cap on the per-tick motion clamp (default 8.0)")
