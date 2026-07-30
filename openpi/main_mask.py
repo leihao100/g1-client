@@ -97,6 +97,7 @@ from main_eef import (
     LEFT_EEF_CHANNELS, RIGHT_EEF_CHANNELS,
     LEFT_GRIPPER_CHANNEL, RIGHT_GRIPPER_CHANNEL, IK_WARN_M,
     build_obs, apply_raisez, log_chunk_ranges,
+    _pct, _stat, _extract_server_ms, _timing_rec,
     _initialize_pose, _wait_for_operator, _cleanup,
 )
 
@@ -187,11 +188,15 @@ def _infer_ik_worker(policy: PolicyClient, obs: dict, kin_ik: G1DualArmKinematic
     """
     try:
         result = policy.infer(obs)
+        box["timing"] = dict(policy.last_timing or {})   # pack/send/wait_recv/unpack (ms via _timing_rec)
+        box["server_ms"] = _extract_server_ms(result)     # server-reported GPU time, if any
+        ik_t0 = time.time()
         eef = np.asarray(result["actions"], dtype=np.float64)
         if eef.ndim != 2 or eef.shape[1] < 16:
             raise RuntimeError(f"Unexpected action shape {eef.shape} (want [H, 16])")
         eef = apply_raisez(eef, raisez)
         joint, ik_max, _ = _ik_chunk(eef, kin_ik, q_seed)
+        box["ik_ms"] = (time.time() - ik_t0) * 1e3        # client-side batch IK cost
         box["eef"] = eef              # kept for EEF-range logging on the main thread
         box["actions"] = joint        # the joint plan the merge consumes
         box["ik_max_m"] = ik_max
@@ -201,12 +206,16 @@ def _infer_ik_worker(policy: PolicyClient, obs: dict, kin_ik: G1DualArmKinematic
 
 # ---------- the weighted overlap merge (the "mask") ----------
 
-def _merge_chunks(old_future: np.ndarray, new_aligned: np.ndarray) -> np.ndarray:
+def _merge_chunks(old_future: np.ndarray, new_aligned: np.ndarray,
+                  blend_start: float = 0.0) -> np.ndarray:
     """Weighted temporal blend of the old plan tail and the time-aligned new chunk.
 
-    Both are JOINT-space [., 16] predictions for the same future timesteps. Over
-    the overlap the old:new weight ramps 1:1 -> 0:1 (a_new 0.5 -> 1.0), so the new
-    chunk fades in. The longer chunk's non-overlapping tail is appended unblended.
+    Both are JOINT-space [., 16] predictions for the same future timesteps. The
+    new-chunk weight ramps from `blend_start` at the first overlap step to 1.0 at
+    the last, so the new chunk fades in. `blend_start=0.0` makes the join seamless
+    (the first merged step equals the old plan exactly — no boundary jump), which
+    is the main knob against boundary 回抽; `blend_start=0.5` is the original 1:1
+    crossfade. The longer chunk's non-overlapping tail is appended unblended.
 
     In this loop's cadence new_aligned is always >= old_future, so the appended
     tail is the new chunk's extra steps — but the old-extends-further branch is
@@ -216,13 +225,79 @@ def _merge_chunks(old_future: np.ndarray, new_aligned: np.ndarray) -> np.ndarray
     L = min(Lo, Ln)
     out = np.empty((max(Lo, Ln), old_future.shape[1]), dtype=np.float64)
     for k in range(L):
-        a_new = 1.0 if L == 1 else 0.5 + 0.5 * (k / (L - 1))
+        a_new = 1.0 if L == 1 else blend_start + (1.0 - blend_start) * (k / (L - 1))
         out[k] = (1.0 - a_new) * old_future[k] + a_new * new_aligned[k]
     if Ln > L:
         out[L:] = new_aligned[L:]
     elif Lo > L:
         out[L:] = old_future[L:]
     return out
+
+
+# ---------- latency profiling ----------
+
+def _summarize_timing(infer_recs, merge_recs, args) -> None:
+    """End-of-run latency breakdown: per-infer components (pack/send/wait_recv/
+    unpack), the network-vs-GPU split of wait_recv, the bottleneck, and the
+    per-merge stall verdict — the same picture main_eef.py prints, plus the
+    client-side batch-IK cost this mask loop adds.
+
+    wait_recv is the blocking recv = network round-trip + the server's GPU
+    inference combined. If the server reports its own infer time (server_ms),
+    network ~= wait_recv - server_ms; otherwise the two can't be separated.
+    """
+    if not infer_recs:
+        return
+    budget_ms = (args.infer_wait / args.control_hz) * 1e3
+    log.info("=" * 64)
+    comps = [("pack", "pack_ms"), ("send", "send_ms"),
+             ("wait_recv", "wait_recv_ms"), ("unpack", "unpack_ms"),
+             ("wall(total)", "wall_ms")]
+    log.info(f"per-infer latency over {len(infer_recs)} calls (ms):")
+    log.info(f"  {'component':<14} {'min':>7} {'p50':>7} {'p95':>7} {'max':>7} {'mean':>7}")
+    means = {}
+    for label, key in comps:
+        mn, p50, p95, mx, me = _stat([r[key] for r in infer_recs])
+        means[label] = me
+        log.info(f"  {label:<14} {mn:7.1f} {p50:7.1f} {p95:7.1f} {mx:7.1f} {me:7.1f}")
+    srv = [r["server_ms"] for r in infer_recs if r["server_ms"] is not None]
+    if srv:
+        mn, p50, p95, mx, me = _stat(srv)
+        log.info(f"  {'server_infer':<14} {mn:7.1f} {p50:7.1f} {p95:7.1f} {mx:7.1f} {me:7.1f}")
+        log.info(f"  => network (wait_recv - server_infer) ~= {means['wait_recv']-me:.1f} ms "
+                 f"mean (GPU compute ~= {me:.1f} ms)")
+    else:
+        log.info("  (server did not report its infer time — wait_recv is network + GPU combined)")
+    sub = {k: means[k] for k in ("pack", "send", "wait_recv", "unpack")}
+    bn = max(sub, key=sub.get)
+    log.info(f"BOTTLENECK (mean): {bn} = {sub[bn]:.1f} ms "
+             f"({sub[bn]/means['wall(total)']*100:.0f}% of infer total)")
+    up = [r["bytes_sent"] for r in infer_recs if r["bytes_sent"] > 0]
+    if up:
+        up_kib = np.mean(up) / 1024
+        log.info(f"  upload payload ~= {up_kib:.0f} KiB/infer"
+                 + ("  (large — decoded RGB; --send-jpeg cuts it ~10-15x)"
+                    if up_kib > 200 else "  (compressed)"))
+    if merge_recs:
+        jw = [r["join_wait_s"] * 1e3 for r in merge_recs]
+        ik = [r["ik_ms"] for r in merge_recs]
+        ikm = [r["ik_max_m"] * 1e3 for r in merge_recs]
+        stalled = sum(1 for x in jw if x > 1.0)
+        log.info(f"merge join_wait (ms): mean={np.mean(jw):.0f} p95={_pct(jw,95):.0f} "
+                 f"max={max(jw):.0f} | stalled {stalled}/{len(jw)} "
+                 f"(overlap budget {budget_ms:.0f}ms)")
+        log.info(f"client IK build/chunk (ms): mean={np.mean(ik):.0f} p95={_pct(ik,95):.0f} "
+                 f"max={max(ik):.0f}")
+        log.info(f"IK residual/chunk (mm): mean={np.mean(ikm):.2f} p95={_pct(ikm,95):.2f} "
+                 f"max={max(ikm):.2f}")
+        if stalled:
+            log.warning(f"{stalled} merge(s) STALLED — infer+IK didn't fit the {budget_ms:.0f}ms "
+                        f"overlap window, so time-alignment breaks and the arm 回抽. Raise "
+                        f"--infer-wait, lower --control-hz, add --send-jpeg, or cut the "
+                        f"bottleneck above.")
+        else:
+            log.info("no merge stalled — infer+IK fully hidden behind execution.")
+    log.info("=" * 64)
 
 
 # ---------- inference loop ----------
@@ -255,6 +330,8 @@ def _run_masked_loop(arm, grip, cam, policy, kin, kin_ik, args) -> None:
         log.warning("gravity feedforward OFF (--tauff-scale 0): the arm will sag below "
                     "commanded poses — state feedback drifts out of the training distribution")
 
+    infer_recs = []   # one per inference (first + each prefetch): latency breakdown
+    merge_recs = []   # one per merge: join_wait, client IK time, IK residual
     with _KeyPoller() as keys:
         log.info("Press [r] at any time to reset to the ready pose and re-arm.")
         while True:
@@ -276,6 +353,7 @@ def _run_masked_loop(arm, grip, cam, policy, kin, kin_ik, args) -> None:
             if plan.shape[0] <= skip + cycle:
                 raise RuntimeError(f"horizon {plan.shape[0]} too short for lead={lead} "
                                    f"wait={wait} (need > {skip + cycle})")
+            infer_recs.append(_timing_rec(dict(policy.last_timing or {}), _extract_server_ms(result)))
 
             ptr = 0              # index of the next step to command within `plan`
             since_merge = 0      # steps commanded since the last merge
@@ -345,19 +423,30 @@ def _run_masked_loop(arm, grip, cam, policy, kin, kin_ik, args) -> None:
                 new_chunk = box["actions"]            # joint [H, 16], row 0 ~ obs@(merge-wait)
                 new_aligned = new_chunk[skip:]        # drop the `wait` already-elapsed steps
                 old_future = plan[ptr:]               # what the old plan still has queued
-                plan = _merge_chunks(old_future, new_aligned)
+                plan = _merge_chunks(old_future, new_aligned, args.blend_start)
                 ik_max = box["ik_max_m"]
                 ptr = 0
                 since_merge = 0
                 prefetch_fired = False
                 th = None
 
+                rec = _timing_rec(box.get("timing", {}), box.get("server_ms"))
+                ik_ms = box.get("ik_ms", 0.0)
+                infer_recs.append(rec)
+                merge_recs.append({"join_wait_s": join_wait_ms / 1e3,
+                                   "ik_ms": ik_ms, "ik_max_m": ik_max})
+
+                net_ms = (rec["wait_recv_ms"] - rec["server_ms"]) if rec["server_ms"] is not None else None
                 overlap = min(len(old_future), len(new_aligned))
                 appended = max(0, len(new_aligned) - len(old_future))
                 log.info(f"[merge {merges}] overlap={overlap} append={appended} "
                          f"plan_len={len(plan)} ik_max={ik_max*1e3:.2f}mm "
                          f"join_wait={join_wait_ms:.0f}ms"
-                         + (f" STALLED" if join_wait_ms > 1.0 else ""))
+                         + (" STALLED" if join_wait_ms > 1.0 else "")
+                         + f" | infer wall={rec['wall_ms']:.0f}ms wait_recv={rec['wait_recv_ms']:.0f}"
+                         + (f" server={rec['server_ms']:.0f} net={net_ms:.0f}" if net_ms is not None else "")
+                         + f" ik_build={ik_ms:.0f}ms"
+                         + (f" up={rec['bytes_sent']/1024:.0f}KiB" if rec['bytes_sent'] > 0 else ""))
                 if ik_max > IK_WARN_M:
                     log.warning(f"[merge {merges}] IK residual {ik_max*1e3:.1f} mm — model "
                                 f"predicted a barely-reachable EEF pose")
@@ -379,6 +468,7 @@ def _run_masked_loop(arm, grip, cam, policy, kin, kin_ik, args) -> None:
     # move runs with the arm's default (tau=0) dynamics.
     if args.tauff_scale > 0:
         arm.set_arm_tauff(np.zeros(14))
+    _summarize_timing(infer_recs, merge_recs, args)
 
 
 # ---------- entry point ----------
@@ -447,6 +537,12 @@ def main() -> None:
                    help="Do not drop the new chunk's leading `infer_wait` steps. By "
                         "default they are dropped so the new chunk is wall-clock "
                         "aligned with the plan it replaces; pass this for A/B testing.")
+    p.add_argument("--blend-start", type=float, default=0.0,
+                   help="New-chunk weight at the FIRST overlap step of the mask, "
+                        "ramping to 1.0 at the last. 0.0 (default) = seamless join "
+                        "(start fully on the old plan, fade to new) — least boundary "
+                        "回抽; 0.5 = the original 1:1 crossfade. Lower is smoother at the "
+                        "cost of the new prediction taking effect a few steps later.")
     # ---- Gravity feedforward (reduced-arm model from eef_kinematics.py) ----
     p.add_argument("--tauff-scale", type=float, default=1.0,
                    help="Scale on the gravity-compensation feedforward torque fed to the "
